@@ -51,6 +51,9 @@ graph TD
 
 ## Detection Logic
 
+> [!WARNING]
+> **DEVELOPMENT STATUS:** The **Masquerade Detection** (PID Hollowing) module is currently under active construction. While the eBPF hooks are in place, the userspace verification logic is not yet fully implemented in `v1.0`. Expect this feature to land in `v1.2`.
+
 The engine classifies process states based on the coherence between the Scheduler and the Filesystem:
 
 * **CLEAN:** The process executes on the CPU and is correctly reported by the OS.

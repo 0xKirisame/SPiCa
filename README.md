@@ -74,14 +74,14 @@ The engine classifies process states based on the coherence between the Schedule
 To build SPiCa, you need a Rust toolchain capable of compiling BPF bytecode.
 
 1.  **Stable Rust:** `rustup toolchain install stable`
-2.  **Nightly Rust:** `rustup toolchain install nightly --component rust-src` (Required for `-Z build-std`)
+2.  **Nightly Rust:** `rustup toolchain install nightly --component rust-src && rustup override set nightly` (Required for `-Z build-std`)
 3.  **BPF Linker:** `cargo install bpf-linker`
 
 ## Build & Run
 
 1.  **Compile the eBPF Kernel Probe and User Agent:**
     ```shell
-    cargo xtask build-ebpf --release
+    cargo run --package xtask build-ebpf --release
     cargo build --release
     ```
 

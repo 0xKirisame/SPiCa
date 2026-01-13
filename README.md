@@ -3,7 +3,7 @@
 
 > "I'm going to sing, so shine bright, SPiCa..."
 
-SPiCa is a high-performance, eBPF-based rootkit detection engine written in Rust. inspired by the hatsune miku song SPiCa which represents hatsune miku as a star watching all oveer us, SPiCa in general terms is a binary star; two stars spinning around eachother forming a bright star, It enforces **Kernel Sovereignty** by establishing a ground truth based on CPU execution rather than relying on potentially compromised system APIs.
+SPiCa is a high-performance, eBPF-based rootkit detection engine written in Rust. inspired by the hatsune miku song SPiCa which represents hatsune miku as a star watching all over us, SPiCa in general terms is a binary star; two stars spinning around eachother forming a bright star, It enforces **Kernel Sovereignty** by establishing a ground truth based on CPU execution rather than relying on potentially compromised system APIs.
 
 By implementing a **Cross-View Differential** architecture, SPiCa detects sophisticated evasion techniques—including Direct Kernel Object Manipulation (DKOM) and PID Hollowing—in real-time with negligible system overhead.
 

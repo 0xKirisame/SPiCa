@@ -48,21 +48,27 @@ async fn main() -> Result<(), anyhow::Error> {
                 .trim_matches(char::from(0));
 
             if !user_pids.contains(&info.tgid) {
-
-                //poke test to check if process still alive
-
+                
                 let is_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
 
                 if !is_alive {
-                    let _ = kernel_orbit.remove(&pid);
+                    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                    let current_ktime = (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64);
                     
-                    suspects.remove(&pid);
-                    continue;
+                    // 100ms window: If seen recently, it's active but hidden.
+                    let time_since_seen = current_ktime.saturating_sub(info.last_seen);
+                    
+                    if time_since_seen > 100_000_000 {
+                         // It's old (>100ms since last CPU sched). Likely actually dead. Remove.
+                        let _ = kernel_orbit.remove(&pid);
+                        suspects.remove(&pid);
+                        continue;
+                    }
                 }
 
                 match suspects.get(&pid) {
 
-                    //Detect hidden processes
                     Some(first_seen) => {
                         if first_seen.elapsed() > Duration::from_secs(SUSPECT_THRESHOLD) {
                             println!("[ROOTKIT DETECTED] PID: {} | NAME: {} | HIDDEN FOR: {:?}", pid, k_name, first_seen.elapsed());
@@ -75,8 +81,6 @@ async fn main() -> Result<(), anyhow::Error> {
             } 
 
             else {
-
-                 //clears suspected processes in case of a race condition
                 if suspects.contains_key(&pid) {
                     suspects.remove(&pid);
                 }

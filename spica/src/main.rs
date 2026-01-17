@@ -71,7 +71,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
                     Some(first_seen) => {
                         if first_seen.elapsed() > Duration::from_secs(SUSPECT_THRESHOLD) {
-                            println!("[ROOTKIT DETECTED] PID: {} | NAME: {} | HIDDEN FOR: {:?}", pid, k_name, first_seen.elapsed());
+                            println!("[DKOM] PID: {} | NAME: {} | HIDDEN FOR: {:?}", pid, k_name, first_seen.elapsed());
                         }
                     },
                     None => {

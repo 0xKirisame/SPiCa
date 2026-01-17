@@ -71,6 +71,12 @@ The engine classifies process states based on the coherence between the Schedule
 
 ## Prerequisites
 
+dependencies:
+
+```shell
+sudo apt update && sudo apt install -y build-essential linux-headers-$(uname -r) libelf-dev clang llvm
+```
+
 To build SPiCa, you need a Rust toolchain capable of compiling BPF bytecode.
 
 1.  **Stable Rust:** `rustup toolchain install stable`

@@ -2,11 +2,13 @@ use aya::{include_bytes_aligned, Bpf};
 use aya::programs::TracePoint;
 use aya::maps::HashMap as AyaHashMap;
 use spica_common::ProcessInfo;
-use std::{fs, thread, time::{Duration, Instant}};
+use tokio::fs;
+use tokio::time::{sleep, Duration};
+use std::time::Instant;
 use std::collections::{HashMap, HashSet};
 
-const TICK_RATE: u64 = 1; //check every 1 second
-const SUSPECT_THRESHOLD: u64 = 2; //register potential hidden process after 2 seconds
+const TICK_RATE: u64 = 1; 
+const SUSPECT_THRESHOLD: u64 = 2; 
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -28,8 +30,8 @@ async fn main() -> Result<(), anyhow::Error> {
         let loop_start = Instant::now();
 
         let mut user_pids: HashSet<u32> = HashSet::new();
-        if let Ok(entries) = fs::read_dir("/proc") {
-            for entry in entries.flatten() {
+        if let Ok(mut entries) = fs::read_dir("/proc").await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
                 if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
                     user_pids.insert(pid);
                 }
@@ -41,7 +43,7 @@ async fn main() -> Result<(), anyhow::Error> {
         let keys: Vec<u32> = kernel_orbit.keys().collect::<Result<_, _>>()?;
 
         for pid in keys {
-            let info = kernel_orbit.get(&pid, 0)?; // 0 = flag
+            let info = kernel_orbit.get(&pid, 0)?; 
 
             let k_name = std::str::from_utf8(&info.comm)
                 .unwrap_or("???")
@@ -56,11 +58,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
                     let current_ktime = (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64);
                     
-                    // 100ms window: If seen recently, it's active but hidden.
                     let time_since_seen = current_ktime.saturating_sub(info.last_seen);
                     
                     if time_since_seen > 100_000_000 {
-                         // It's old (>100ms since last CPU sched). Likely actually dead. Remove.
                         let _ = kernel_orbit.remove(&pid);
                         suspects.remove(&pid);
                         continue;
@@ -68,7 +68,6 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
 
                 match suspects.get(&pid) {
-
                     Some(first_seen) => {
                         if first_seen.elapsed() > Duration::from_secs(SUSPECT_THRESHOLD) {
                             println!("[DKOM] PID: {} | NAME: {} | HIDDEN FOR: {:?}", pid, k_name, first_seen.elapsed());
@@ -79,7 +78,6 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                 }
             } 
-
             else {
                 if suspects.contains_key(&pid) {
                     suspects.remove(&pid);
@@ -91,7 +89,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
         let elapsed = loop_start.elapsed();
         if elapsed < Duration::from_secs(TICK_RATE) {
-            thread::sleep(Duration::from_secs(TICK_RATE) - elapsed);
+            sleep(Duration::from_secs(TICK_RATE) - elapsed).await;
         }
     }
 }

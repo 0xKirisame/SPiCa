@@ -77,13 +77,19 @@ dependencies:
 sudo apt update && sudo apt install -y build-essential linux-headers-$(uname -r) libelf-dev clang llvm
 ```
 
+To build SPiCa, you need a Rust toolchain capable of compiling BPF bytecode.
+
+1.  **Stable Rust:** `rustup toolchain install stable`
+2.  **Nightly Rust:** `rustup toolchain install nightly --component rust-src && rustup override set nightly` (Required for `-Z build-std`)
+3.  **BPF Linker:** `cargo install bpf-linker`
+
 ## Build & Run
 
 1.  **Compile the eBPF Kernel Probe and User Agent:**
-    ```shell
-    cd spica
-    make
-    ```
+
+```shell
+    cargo run --package xtask build-ebpf --release
+```
 
 2.  **Run the Detector:**
     ```shell

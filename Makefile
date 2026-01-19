@@ -4,9 +4,14 @@ XTASK := $(RUSTUP) run nightly $(CARGO) run --package xtask
 TARGET_DIR := target/release
 BINARY := spica
 
-.PHONY: all build build-ebpf build-user run clean check test help
+.PHONY: all setup build build-ebpf build-user run clean check test help
 
 all: build
+
+setup:
+	@echo "Setting up Nightly Toolchain..."
+	$(RUSTUP) toolchain install nightly
+	$(RUSTUP) override set nightly
 
 build-ebpf:
 	@echo "Building eBPF Kernel Probe..."
@@ -40,8 +45,9 @@ test:
 
 help:
 	@echo "Available commands:"
-	@echo "  make build"
-	@echo "  make run"
-	@echo "  make dev"
-	@echo "  make clean"
-	@echo "  make check"
+	@echo "  make setup      - Install Nightly Rust and set directory override"
+	@echo "  make build      - Build everything (eBPF + Userspace Release)"
+	@echo "  make run        - Build and run SPiCa (requires sudo)"
+	@echo "  make dev        - Build and run in debug mode"
+	@echo "  make clean      - Remove build artifacts"
+	@echo "  make check      - Run cargo check"

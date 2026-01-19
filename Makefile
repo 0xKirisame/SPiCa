@@ -1,5 +1,6 @@
 CARGO := cargo
-XTASK := $(CARGO) +nightly run --package xtask
+RUSTUP := rustup
+XTASK := $(RUSTUP) run nightly $(CARGO) run --package xtask
 TARGET_DIR := target/release
 BINARY := spica
 

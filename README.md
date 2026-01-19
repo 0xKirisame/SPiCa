@@ -12,41 +12,41 @@ By implementing a **Cross-View Differential** architecture, SPiCa detects sophis
 SPiCa operates on a "Binary Star" principle, maintaining two distinct observational vantages to identify discrepancies in system state:
 
 1.  **The Kernel View (Ground Truth):**
-    Utilizes an eBPF probe hooked into the `sched_switch` tracepoint. This captures the raw execution context of every process the moment it touches the CPU, bypassing the Virtual File System (VFS) and standard syscall tables.
+Utilizes an eBPF probe hooked into the `sched_switch` tracepoint. This captures the raw execution context of every process the moment it touches the CPU, bypassing the Virtual File System (VFS) and standard syscall tables.
 
 2.  **The User View (Reported Reality):**
-    Queries standard system APIs (`/proc` filesystem) to retrieve the list of processes the Operating System *claims* are running.
+Queries standard system APIs (`/proc` filesystem) to retrieve the list of processes the Operating System *claims* are running.
 
 3.  **The Differential Engine:**
-    A userspace Finite State Machine (FSM) synchronizes these two views. Any process execution observed in the Kernel that lacks a corresponding entry in the User View is flagged as an anomaly.
+A userspace Finite State Machine (FSM) synchronizes these two views. Any process execution observed in the Kernel that lacks a corresponding entry in the User View is flagged as an anomaly.
 
 ```mermaid
 graph TD
-    subgraph "Kernel Space (Ring 0)"
-        A[Process Scheduled] -->|Trigger| B(Tracepoint: sched_switch)
-        B -->|Capture Context| C{eBPF Probe}
-        C -->|Write PID/Comm| D[(eBPF LRU Map)]
-    end
+   subgraph "Kernel Space (Ring 0)"
+       A[Process Scheduled] -->|Trigger| B(Tracepoint: sched_switch)
+       B -->|Capture Context| C{eBPF Probe}
+       C -->|Write PID/Comm| D[(eBPF LRU Map)]
+   end
 
-    subgraph "User Space (Ring 3)"
-        E[SPiCa Engine] -->|Poll| D
-        E -->|Read| F[/proc Filesystem/]
-        
-        D -- "Physical Reality" --> G{Differential Analysis}
-        F -- "Reported Reality" --> G
-        
-        G -->|Match| H[Clean]
-        G -->|Mismatch| I[Anomaly Detected]
-    end
-    
-    %% Styling
-    classDef kernel fill:#f9f2f4,stroke:#d63384,stroke-width:2px;
-    classDef user fill:#e7f5ff,stroke:#0d6efd,stroke-width:2px;
-    classDef logic fill:#fff3cd,stroke:#ffc107,stroke-width:2px;
-    
-    class A,B,C,D kernel;
-    class F,E user;
-    class G,H,I logic;
+   subgraph "User Space (Ring 3)"
+       E[SPiCa Engine] -->|Poll| D
+       E -->|Read| F[/proc Filesystem/]
+       
+       D -- "Physical Reality" --> G{Differential Analysis}
+       F -- "Reported Reality" --> G
+       
+       G -->|Match| H[Clean]
+       G -->|Mismatch| I[Anomaly Detected]
+   end
+   
+   %% Styling
+   classDef kernel fill:#f9f2f4,stroke:#d63384,stroke-width:2px;
+   classDef user fill:#e7f5ff,stroke:#0d6efd,stroke-width:2px;
+   classDef logic fill:#fff3cd,stroke:#ffc107,stroke-width:2px;
+   
+   class A,B,C,D kernel;
+   class F,E user;
+   class G,H,I logic;
 ```
 
 ## Detection Logic
@@ -86,15 +86,15 @@ To build SPiCa, you need a Rust toolchain capable of compiling BPF bytecode.
 ## Build & Run
 
 1.  **Compile the eBPF Kernel Probe and User Agent:**
-
 ```shell
-    cargo run --package xtask build-ebpf --release
+cargo run --package xtask build-ebpf --release
+cargo build --release
 ```
 
 2.  **Run the Detector:**
-    ```shell
-    sudo ./target/release/spica
-    ```
+```shell
+   sudo ./target/release/spica
+   ```
 
 ## License
 

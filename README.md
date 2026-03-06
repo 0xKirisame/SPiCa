@@ -1,6 +1,10 @@
 # SPiCa
 **System Process Integrity & Cross-view Analysis**
 
+<p align="center">
+  <img src="https://static.wikia.nocookie.net/vocaloid/images/d/db/SPiCa.png/revision/latest?cb=20111120165336" alt="SPiCa" width="400" />
+</p>
+
 > "I'm going to sing, so shine bright, SPiCa..."
 
 SPiCa is a high-performance, eBPF-based rootkit detection engine written in Rust. inspired by the hatsune miku song SPiCa which represents hatsune miku as a star watching all over us, SPiCa in general terms is a binary star; two stars spinning around eachother forming a bright star, It enforces **Kernel Sovereignty** by establishing a ground truth based on CPU execution rather than relying on potentially compromised system APIs.

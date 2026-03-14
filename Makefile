@@ -23,7 +23,7 @@ help:
 
 install-tools:
 	cargo install bpf-linker
-	cargo install aya-tool
+	cargo install --git https://github.com/aya-rs/aya aya-tool
 
 generate-vmlinux:
 	cargo run --package xtask generate-vmlinux

@@ -117,8 +117,6 @@ make run             # sudo ./target/release/spica
 | Run detector | `make run` | Requires root |
 | Clean | `make clean` | Removes build artifacts |
 
-> **Mac users:** Edit code on Mac, push, then run `make all && make run` on your Linux target.
-
 Run `make help` to see all available targets.
 
 ## Planned: spica-network ("1/6 out of gravity")

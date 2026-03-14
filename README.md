@@ -39,7 +39,7 @@ graph TD
    subgraph "User Space (Ring 3)"
        F[SPiCa Engine] -->|Async read| D
        F -->|Async read| E
-       F -->|Read| G[/proc Filesystem]
+       F -->|Read| G["/proc Filesystem"]
 
        D -- "sched_seen map" --> H{Differential FSM}
        E -- "nmi_seen map"   --> H
@@ -94,30 +94,32 @@ Rust toolchain:
 
 1. **Stable Rust:** `rustup toolchain install stable`
 2. **Nightly Rust:** `rustup toolchain install nightly --component rust-src && rustup override set nightly`
-3. **BPF Linker:** `cargo install bpf-linker`
-4. **aya-tool:** `cargo install aya-tool` (for vmlinux binding generation)
+3. **BPF Linker + aya-tool:** `make install-tools`
 
 ## Build & Run
 
-1. **Generate vmlinux BTF bindings** (once per kernel version — gitignored, kernel-specific):
+**Typical Linux setup (one-time):**
 ```shell
-cargo run --package xtask generate-vmlinux
+make install-tools   # installs bpf-linker and aya-tool
+make all             # generate-vmlinux → build-ebpf → build
+make run             # sudo ./target/release/spica
 ```
 
-2. **Compile the eBPF kernel probe:**
-```shell
-cargo run --package xtask build-ebpf --release
-```
+**Individual targets:**
 
-3. **Compile the userspace engine:**
-```shell
-cargo build --release
-```
+| Target | Command | Notes |
+|--------|---------|-------|
+| Install Rust tools | `make install-tools` | Run once |
+| BTF bindings | `make generate-vmlinux` | Run once per kernel update |
+| eBPF probe | `make build-ebpf` | Linux only |
+| Userspace engine | `make build` | |
+| Full pipeline | `make all` | generate-vmlinux → build-ebpf → build |
+| Run detector | `make run` | Requires root |
+| Clean | `make clean` | Removes build artifacts |
 
-4. **Run the detector:**
-```shell
-sudo ./target/release/spica
-```
+> **Mac users:** Edit code on Mac, push, then run `make all && make run` on your Linux target.
+
+Run `make help` to see all available targets.
 
 ## Planned: spica-network ("1/6 out of gravity")
 

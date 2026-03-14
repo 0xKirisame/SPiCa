@@ -1,25 +1,40 @@
 # SPiCa Makefile
-# Mac: edit code here, push, then run on Linux target.
-# Linux: run `make install-tools` once, then `make all` to build, `make run` to detect.
+# Run `make install-deps` and `make install-tools` once, then `make all` to build, `make run` to detect.
 
-.PHONY: help install-tools generate-vmlinux build-ebpf build all run clean
+.PHONY: help install-deps install-tools generate-vmlinux build-ebpf build all run clean
 
 # Default target
 help:
 	@echo "SPiCa — build targets:"
 	@echo ""
-	@echo "  install-tools      Install bpf-linker and aya-tool (Linux, run once)"
-	@echo "  generate-vmlinux   Generate BTF bindings for running kernel (Linux, run once per kernel update)"
-	@echo "  build-ebpf         Compile the eBPF kernel probe (Linux)"
+	@echo "  install-deps       Install system dependencies (requires root)"
+	@echo "  install-tools      Install bpf-linker and aya-tool (run once)"
+	@echo "  generate-vmlinux   Generate BTF bindings for running kernel (run once per kernel update)"
+	@echo "  build-ebpf         Compile the eBPF kernel probe"
 	@echo "  build              Compile the userspace engine"
-	@echo "  all                Full pipeline: generate-vmlinux → build-ebpf → build (Linux)"
-	@echo "  run                Run SPiCa (Linux, requires root)"
+	@echo "  all                Full pipeline: generate-vmlinux → build-ebpf → build"
+	@echo "  run                Run SPiCa (requires root)"
 	@echo "  clean              Remove build artifacts"
 	@echo ""
-	@echo "  Typical Linux setup:"
+	@echo "  Typical setup:"
+	@echo "    make install-deps"
 	@echo "    make install-tools"
 	@echo "    make all"
 	@echo "    make run"
+
+install-deps:
+	@if command -v pacman >/dev/null 2>&1; then \
+		sudo pacman -S --needed --noconfirm base-devel clang llvm libelf bpf; \
+	elif command -v apt-get >/dev/null 2>&1; then \
+		sudo apt-get update && sudo apt-get install -y build-essential clang llvm libelf-dev linux-tools-common bpftool; \
+	elif command -v dnf >/dev/null 2>&1; then \
+		sudo dnf install -y clang llvm elfutils-libelf-devel bpftool; \
+	else \
+		echo "Unsupported package manager. Install clang, llvm, libelf, and bpftool manually."; \
+		exit 1; \
+	fi
+	rustup toolchain install nightly --component rust-src
+	rustup override set nightly
 
 install-tools:
 	cargo install bpf-linker

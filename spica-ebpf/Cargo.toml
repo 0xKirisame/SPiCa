@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 spica-common = { path = "../spica-common" }
 
-aya-ebpf = { workspace = true, features = ["btf-tracepoint"] }
+aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
 
 [build-dependencies]

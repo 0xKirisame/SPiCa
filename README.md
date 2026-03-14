@@ -84,23 +84,36 @@ A 50 ms grace window filters short-lived processes before they reach suspect sta
 
 ## Prerequisites
 
-System dependencies:
+### System dependencies
 
+**Arch Linux:**
 ```shell
-sudo apt update && sudo apt install -y build-essential linux-headers-$(uname -r) libelf-dev clang llvm
+sudo pacman -S --needed base-devel clang llvm libelf bpf
 ```
 
-Rust toolchain:
+**Debian/Ubuntu:**
+```shell
+sudo apt-get update && sudo apt-get install -y build-essential clang llvm libelf-dev linux-tools-common bpftool
+```
 
-1. **Stable Rust:** `rustup toolchain install stable`
-2. **Nightly Rust:** `rustup toolchain install nightly --component rust-src && rustup override set nightly`
-3. **BPF Linker + aya-tool:** `make install-tools`
+**Fedora:**
+```shell
+sudo dnf install -y clang llvm elfutils-libelf-devel bpftool
+```
+
+### Rust toolchain
+
+1. **Nightly Rust (required):** `rustup toolchain install nightly --component rust-src && rustup override set nightly`
+2. **BPF Linker + aya-tool:** `make install-tools`
+
+Or just run `make install-deps` to handle both system packages and the Rust nightly toolchain.
 
 ## Build & Run
 
-**Typical Linux setup (one-time):**
+**Full setup (one-time):**
 ```shell
-make install-tools   # installs bpf-linker and aya-tool
+make install-deps    # system packages + nightly Rust
+make install-tools   # bpf-linker and aya-tool
 make all             # generate-vmlinux → build-ebpf → build
 make run             # sudo ./target/release/spica
 ```
@@ -109,9 +122,10 @@ make run             # sudo ./target/release/spica
 
 | Target | Command | Notes |
 |--------|---------|-------|
-| Install Rust tools | `make install-tools` | Run once |
+| System deps | `make install-deps` | Run once, requires root |
+| Rust tools | `make install-tools` | Run once |
 | BTF bindings | `make generate-vmlinux` | Run once per kernel update |
-| eBPF probe | `make build-ebpf` | Linux only |
+| eBPF probe | `make build-ebpf` | |
 | Userspace engine | `make build` | |
 | Full pipeline | `make all` | generate-vmlinux → build-ebpf → build |
 | Run detector | `make run` | Requires root |

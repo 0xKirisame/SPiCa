@@ -48,7 +48,6 @@ graph TD
        H -->|Both channels + /proc| I[CLEAN]
        H -->|/proc absent > 2s| J["[DKOM]"]
        H -->|NMI seen, sched never| K["[PROBE_TAMPER]"]
-       H -->|comm != exe basename| L["[MASQUERADE]"]
    end
 
    classDef kernel fill:#f9f2f4,stroke:#d63384,stroke-width:2px;
@@ -57,7 +56,7 @@ graph TD
 
    class A,B,C,D,E kernel;
    class F,G user;
-   class H,I,J,K,L logic;
+   class H,I,J,K logic;
 ```
 
 ## Detection Logic
@@ -68,7 +67,6 @@ The engine classifies process states across three alert classes:
 |-------|-----------|---------------------------|
 | `[DKOM]` | Kernel-scheduled TGID absent from `/proc` for >2 s | Direct Kernel Object Manipulation |
 | `[PROBE_TAMPER]` | NMI channel sees TGID; sched_switch channel has **never** seen it | eBPF hook output cleaning / tracepoint suppression |
-| `[MASQUERADE]` | Kernel `comm` (from `task_struct`) ≠ `/proc/{tgid}/exe` basename | PID hollowing / process name spoofing |
 
 A 50 ms grace window filters short-lived processes before they reach suspect state.
 
@@ -80,7 +78,6 @@ A 50 ms grace window filters short-lived processes before they reach suspect sta
 * **Kernel type access:** BTF/CO-RE (`bpf_probe_read_kernel` on `task_struct`)
 * **Event delivery:** RingBuf (push-based, microsecond latency)
 * **Async runtime:** Tokio (non-blocking ring buffer reads + signal handling)
-* **Verification:** `/proc/{tgid}/exe` symlink comparison for masquerade detection
 
 ## Prerequisites
 

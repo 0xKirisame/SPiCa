@@ -58,7 +58,7 @@ fn main() -> Result<(), anyhow::Error> {
             let out_path = "spica-ebpf/src/vmlinux.rs";
 
             let output = Command::new("aya-tool")
-                .args(["generate", "vmlinux"])
+                .args(["generate", "task_struct"])
                 .output()
                 .context("Failed to run aya-tool. Install with: cargo install aya-tool")?;
 

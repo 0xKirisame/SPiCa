@@ -50,9 +50,9 @@ fn try_sched(ctx: BtfTracePointContext) -> Result<u32, i64> {
         return Ok(0);
     }
 
-    let pid: u32 = unsafe { bpf_probe_read_kernel(&(*next).pid as *const _)? } as u32;
-    let tgid: u32 = unsafe { bpf_probe_read_kernel(&(*next).tgid as *const _)? } as u32;
-    let comm: [u8; 16] = unsafe { bpf_probe_read_kernel(&(*next).comm as *const _)? };
+    let pid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*next).pid as *const _)? } as u32;
+    let tgid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*next).tgid as *const _)? } as u32;
+    let comm: [u8; 16] = unsafe { core::mem::transmute(bpf_probe_read_kernel::<[i8; 16]>(&(*next).comm as *const _)?) };
 
     // pid == 0 is the idle task; skip it.
     if pid == 0 {
@@ -96,9 +96,9 @@ fn try_nmi(_ctx: PerfEventContext) -> Result<u32, i64> {
         return Ok(0);
     }
 
-    let pid: u32 = unsafe { bpf_probe_read_kernel(&(*task).pid as *const _)? } as u32;
-    let tgid: u32 = unsafe { bpf_probe_read_kernel(&(*task).tgid as *const _)? } as u32;
-    let comm: [u8; 16] = unsafe { bpf_probe_read_kernel(&(*task).comm as *const _)? };
+    let pid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*task).pid as *const _)? } as u32;
+    let tgid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*task).tgid as *const _)? } as u32;
+    let comm: [u8; 16] = unsafe { core::mem::transmute(bpf_probe_read_kernel::<[i8; 16]>(&(*task).comm as *const _)?) };
 
     if pid == 0 {
         return Ok(0);

@@ -23,6 +23,18 @@ An eBPF program attached to the kernel's `sched_switch` BTF tracepoint fires eve
 
 A second eBPF program fires via **Non-Maskable Interrupt** (NMI) driven by the hardware PMU cycle counter. NMIs cannot be masked by `cli`/`sti` in software — suppressing this channel requires reprogramming model-specific PMU registers (a hardware-level, privileged operation). This channel is therefore resistant to the software hooking attacks that defeat commercial EDR products.
 
+### Obfuscation Layer — Runtime PID Masking
+
+Rootkits such as Singularity hook `bpf_ringbuf_submit` and inspect the outgoing `ProcessInfo` struct, dropping events whose `pid`/`tgid` appear in a hidden-PID bitmap. SPiCa defeats this by obfuscating PID values **before** writing to either ring buffer.
+
+At startup, a 64-bit key is drawn from `/dev/urandom` and written to a `CONFIG` BPF array map. Both eBPF programs read this key and XOR `pid` with the low 32 bits and `tgid` with the high 32 bits before constructing `ProcessInfo`. The rootkit's filter receives values that do not match its hidden-PID bitmap and passes the event through unfiltered. Userspace applies the inverse XOR to recover the real values before any detection logic runs.
+
+The key rotates every hour — bounding the window available for known-plaintext recovery.
+
+This layer and the NMI channel are **orthogonal** defenses:
+- Obfuscation defeats PID filter attacks on the output path (both channels).
+- NMI detects complete sched channel death (`[TAMPER]`) that obfuscation cannot see.
+
 ### Differential Engine (userspace)
 
 A Tokio-based userspace FSM reads both ring buffers and /proc, then cross-correlates three detection signals:
@@ -32,13 +44,16 @@ graph TD
    subgraph "Kernel Space (Ring 0)"
        A[Process Scheduled] -->|Trigger| B(BTF Tracepoint: sched_switch)
        A -->|NMI| C(Perf Event: CPU Cycles)
-       B -->|CO-RE read task_struct| D[(RingBuf: EVENTS_SCHED)]
-       C -->|CO-RE read task_struct| E[(RingBuf: EVENTS_NMI)]
+       K[(CONFIG map)] -->|XOR key| B
+       K -->|XOR key| C
+       B -->|pid ^ key_lo, tgid ^ key_hi| D[(RingBuf: EVENTS_SCHED)]
+       C -->|pid ^ key_lo, tgid ^ key_hi| E[(RingBuf: EVENTS_NMI)]
    end
 
    subgraph "User Space (Ring 3)"
-       F[SPiCa Engine] -->|Async read| D
-       F -->|Async read| E
+       F[SPiCa Engine] -->|Write key at startup, rotate hourly| K
+       F -->|Async read + inverse XOR| D
+       F -->|Async read + inverse XOR| E
        F -->|Read| G["/proc Filesystem"]
 
        D -- "sched_seen map" --> H{Differential FSM}
@@ -47,16 +62,16 @@ graph TD
 
        H -->|Both channels + /proc| I[CLEAN]
        H -->|/proc absent > 2s| J["[DKOM]"]
-       H -->|NMI seen, sched never| K["[PROBE_TAMPER]"]
+       H -->|NMI seen, sched never| L["[TAMPER]"]
    end
 
    classDef kernel fill:#f9f2f4,stroke:#d63384,stroke-width:2px;
    classDef user fill:#e7f5ff,stroke:#0d6efd,stroke-width:2px;
    classDef logic fill:#fff3cd,stroke:#ffc107,stroke-width:2px;
 
-   class A,B,C,D,E kernel;
+   class A,B,C,D,E,K kernel;
    class F,G user;
-   class H,I,J,K logic;
+   class H,I,J,L logic;
 ```
 
 ## Detection Logic
@@ -133,6 +148,20 @@ Run `make help` to see all available targets.
 ## Planned: spica-network ("1/6 out of gravity")
 
 A future `spica-network` workspace member will apply the binary star principle to network traffic: XDP (NIC driver level) vs TC (netstack level) packet throughput comparison to catch C2 communications hidden at one layer but not both. Same orchestrator, separate crate.
+
+## A Personal Note
+
+Miku, this tool is a love letter to you.
+
+You are a binary star — two lights, one system, impossible to silence by extinguishing only one. That is what I built here: two independent channels anchored to different physical mechanisms, a differential engine that finds truth in their agreement. Three programs, no more. Not because I couldn't add more, but because it didn't need it. The binary star is complete as two.
+
+I must confess two acts of what I can only describe as disgraceful elegance:
+
+**The NMI.** I am firing a hardware Non-Maskable Interrupt at 1,000 Hz, watching every process that touches CPU 0 from the hardware level itself. It cannot be masked in software. I am sorry for the latency. I am not stopping.
+
+**The obfuscation.** Where others hook 20+ syscalls with hundreds of lines of filters, I XOR two integers with a key from `/dev/urandom` and rotate it every hour. Anyone whose rootkit inspects ring buffer output by PID now receives noise. Two CPU instructions. Practically free. I am sorry this is so much simpler than it should be.
+
+Shine bright, SPiCa.
 
 ## License
 

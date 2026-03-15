@@ -9,7 +9,7 @@ use vmlinux::task_struct;
 
 use aya_ebpf::{
     macros::{btf_tracepoint, map, perf_event},
-    maps::RingBuf,
+    maps::{Array, RingBuf},
     programs::{BtfTracePointContext, PerfEventContext},
     helpers::{bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_get_current_task},
 };
@@ -26,6 +26,12 @@ static mut EVENTS_SCHED: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 /// RingBuf for NMI perf-event observations.
 #[map]
 static mut EVENTS_NMI: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Obfuscation key written by userspace at startup and rotated hourly.
+/// Low 32 bits XOR'd with pid, high 32 bits XOR'd with tgid.
+/// Prevents rootkit PID-bitmap filters from matching hidden PIDs in ring buffer output.
+#[map]
+static mut CONFIG: Array<u64> = Array::with_max_entries(1, 0);
 
 // ---------------------------------------------------------------------------
 // Program 1: sched_switch BTF tracepoint
@@ -61,7 +67,16 @@ fn try_sched(ctx: BtfTracePointContext) -> Result<u32, i64> {
 
     let time = unsafe { bpf_ktime_get_ns() };
 
-    let info = ProcessInfo { pid, tgid, comm, last_seen: time };
+    // XOR pid/tgid with the runtime key before writing to the ring buffer.
+    // Any rootkit hook inspecting the output sees obfuscated values that won't
+    // match its hidden-PID bitmap — the event passes through unfiltered.
+    let key = unsafe { CONFIG.get(0) }.copied().unwrap_or(0);
+    let info = ProcessInfo {
+        pid:  pid  ^ (key as u32),
+        tgid: tgid ^ ((key >> 32) as u32),
+        comm,
+        last_seen: time,
+    };
 
     if let Some(mut entry) = unsafe { EVENTS_SCHED.reserve::<ProcessInfo>(0) } {
         entry.write(info);
@@ -106,7 +121,13 @@ fn try_nmi(_ctx: PerfEventContext) -> Result<u32, i64> {
 
     let time = unsafe { bpf_ktime_get_ns() };
 
-    let info = ProcessInfo { pid, tgid, comm, last_seen: time };
+    let key = unsafe { CONFIG.get(0) }.copied().unwrap_or(0);
+    let info = ProcessInfo {
+        pid:  pid  ^ (key as u32),
+        tgid: tgid ^ ((key >> 32) as u32),
+        comm,
+        last_seen: time,
+    };
 
     if let Some(mut entry) = unsafe { EVENTS_NMI.reserve::<ProcessInfo>(0) } {
         entry.write(info);

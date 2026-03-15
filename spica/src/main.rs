@@ -1,7 +1,7 @@
 #![allow(deprecated)] // aya renames Bpf → Ebpf in newer versions
 
 use aya::{include_bytes_aligned, Bpf, Btf};
-use aya::maps::RingBuf;
+use aya::maps::{Array, RingBuf};
 use aya::programs::{
     BtfTracePoint, PerfEvent,
     perf_event::{HardwareEvent, PerfEventConfig, PerfEventScope, SamplePolicy},
@@ -10,6 +10,7 @@ use spica_common::ProcessInfo;
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Read,
     path::Path,
     time::{Duration, Instant},
 };
@@ -160,6 +161,12 @@ fn resolve_comm(tgid: u32) -> String {
         .to_string()
 }
 
+fn urandom_u64() -> Result<u64, std::io::Error> {
+    let mut buf = [0u8; 8];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(u64::from_ne_bytes(buf))
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -187,6 +194,16 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut sched_fd = AsyncFd::new(sched_rb)?;
     let mut nmi_fd   = AsyncFd::new(nmi_rb)?;
 
+    // Generate a u64 obfuscation key from /dev/urandom.
+    // Low 32 bits → XOR'd with pid, high 32 bits → XOR'd with tgid.
+    // The eBPF programs read this key and obfuscate before writing to ring buffers,
+    // so any rootkit hook filtering on raw PID values sees only noise.
+    let mut obf_key: u64 = urandom_u64()?;
+    let mut config_map = Array::<_, u64>::try_from(bpf.take_map("CONFIG").unwrap())?;
+    config_map.set(0, obf_key, 0)?;
+    let mut pid_key  = obf_key as u32;
+    let mut tgid_key = (obf_key >> 32) as u32;
+
     let mut sched_seen: SeenMap = HashMap::new();
     let mut nmi_seen:   SeenMap = HashMap::new();
     let mut suspects:   HashMap<u32, Instant> = HashMap::new();
@@ -206,16 +223,24 @@ async fn main() -> Result<(), anyhow::Error> {
     println!("SPiCa running — press Ctrl+C to quit");
 
     // ── Main loop ────────────────────────────────────────────────────────────
-    let mut tick = tokio::time::interval(Duration::from_millis(TICK_RATE_MS));
+    let mut tick   = tokio::time::interval(Duration::from_millis(TICK_RATE_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut rotate = tokio::time::interval(Duration::from_secs(3600));
+    rotate.tick().await; // consume the immediate first tick
     loop {
         tokio::select! {
             guard = sched_fd.readable_mut() => {
                 let mut guard = guard?;
                 let rb = guard.get_inner_mut();
                 while let Some(item) = rb.next() {
-                    let info = unsafe { &*(item.as_ptr() as *const ProcessInfo) };
-                    process_event(info, &mut sched_seen, &mut nmi_seen, &mut suspects, Channel::Sched);
+                    let raw = unsafe { &*(item.as_ptr() as *const ProcessInfo) };
+                    let info = ProcessInfo {
+                        pid:  raw.pid  ^ pid_key,
+                        tgid: raw.tgid ^ tgid_key,
+                        comm: raw.comm,
+                        last_seen: raw.last_seen,
+                    };
+                    process_event(&info, &mut sched_seen, &mut nmi_seen, &mut suspects, Channel::Sched);
                 }
                 guard.clear_ready();
             }
@@ -223,13 +248,26 @@ async fn main() -> Result<(), anyhow::Error> {
                 let mut guard = guard?;
                 let rb = guard.get_inner_mut();
                 while let Some(item) = rb.next() {
-                    let info = unsafe { &*(item.as_ptr() as *const ProcessInfo) };
-                    process_event(info, &mut sched_seen, &mut nmi_seen, &mut suspects, Channel::Nmi);
+                    let raw = unsafe { &*(item.as_ptr() as *const ProcessInfo) };
+                    let info = ProcessInfo {
+                        pid:  raw.pid  ^ pid_key,
+                        tgid: raw.tgid ^ tgid_key,
+                        comm: raw.comm,
+                        last_seen: raw.last_seen,
+                    };
+                    process_event(&info, &mut sched_seen, &mut nmi_seen, &mut suspects, Channel::Nmi);
                 }
                 guard.clear_ready();
             }
             _ = tick.tick() => {
                 run_detection(&mut sched_seen, &mut nmi_seen, &mut suspects, &mut tamper_alerted, &mut dkom_alerted);
+            }
+            _ = rotate.tick() => {
+                obf_key  = urandom_u64()?;
+                config_map.set(0, obf_key, 0)?;
+                pid_key  = obf_key as u32;
+                tgid_key = (obf_key >> 32) as u32;
+                println!("[SPICA]      obfuscation key rotated");
             }
             _ = tokio::signal::ctrl_c() => { break; }
         }

@@ -198,7 +198,6 @@ A future `spica-network` workspace member will apply the binary star principle t
 
 ## License
 
-<<<<<<< HEAD
 **SPiCa Engine License:** The source code for this project (Rust, eBPF, and C components) is licensed under the [GNU General Public License v2.0](LICENSE) (GPLv2). 
 
 **Character Attribution:**
@@ -206,11 +205,3 @@ A future `spica-network` workspace member will apply the binary star principle t
 This project is an independent, non-commercial research tool and is not officially affiliated with Crypton Future Media. The character is used under the guidelines of the [Piapro Character License (PCL)](https://piapro.jp/license/pcl/summary). 
 
 The SPiCa project name is inspired by the original song by Toku-P. 
-
-=======
-**SPiCa Engine License:** The source code for this project (Rust, eBPF, and C components) is licensed under the [GNU General Public License v2.0 (GPLv2)](LICENSE-GPL2).
-
-**Character Attribution:** "Hatsune Miku" and associated character artwork are copyrighted properties of Crypton Future Media, INC. (www.piapro.net). This project is an independent, non-commercial research tool and is not officially affiliated with Crypton Future Media. The character is used under the guidelines of the Piapro Character License (PCL).
-
-The SPiCa project name is inspired by the original song by Toku-P.
->>>>>>> 4d82e50 (SPiCa v2.1: added multiple bypasses mitigations)

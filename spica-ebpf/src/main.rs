@@ -57,7 +57,11 @@ fn try_sched(ctx: BtfTracePointContext) -> Result<u32, i64> {
     let pid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*next).pid as *const _)? } as u32;
     let tgid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*next).tgid as *const _)? } as u32;
     let comm: [u8; 16] = unsafe { core::mem::transmute(bpf_probe_read_kernel::<[i8; 16]>(&(*next).comm as *const _)?) };
-    let start_time_ns: u64 = unsafe { bpf_probe_read_kernel::<u64>(&(*next).start_time as *const _)? };
+    // Read start_time from the group leader (main thread), not the current thread.
+    // All threads in a process share the same tgid but have distinct per-thread start_times.
+    // group_leader->start_time is the stable process birth timestamp.
+    let group_leader = unsafe { bpf_probe_read_kernel::<u64>(&(*next).group_leader as *const _ as *const u64)? } as *const task_struct;
+    let start_time_ns: u64 = unsafe { bpf_probe_read_kernel::<u64>(&(*group_leader).start_time as *const _)? };
 
     // pid == 0 is the idle task; skip it.
     if pid == 0 {
@@ -117,7 +121,8 @@ fn try_nmi(_ctx: PerfEventContext) -> Result<u32, i64> {
     let pid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*task).pid as *const _)? } as u32;
     let tgid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*task).tgid as *const _)? } as u32;
     let comm: [u8; 16] = unsafe { core::mem::transmute(bpf_probe_read_kernel::<[i8; 16]>(&(*task).comm as *const _)?) };
-    let start_time_ns: u64 = unsafe { bpf_probe_read_kernel::<u64>(&(*task).start_time as *const _)? };
+    let group_leader = unsafe { bpf_probe_read_kernel::<u64>(&(*task).group_leader as *const _ as *const u64)? } as *const task_struct;
+    let start_time_ns: u64 = unsafe { bpf_probe_read_kernel::<u64>(&(*group_leader).start_time as *const _)? };
 
     if pid == 0 {
         return Ok(0);

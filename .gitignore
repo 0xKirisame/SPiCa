@@ -10,6 +10,7 @@ target/
 
 # Generated vmlinux bindings (kernel-version-specific, must regenerate per host)
 spica-ebpf/src/vmlinux.rs
+spica-ebpf/src/generated_keys.rs
 
 # Claude Code session data and memory
 .claude/

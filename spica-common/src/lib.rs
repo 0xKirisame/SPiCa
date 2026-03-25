@@ -7,6 +7,9 @@ pub struct ProcessInfo {
     pub tgid: u32,
     pub comm: [u8; 16],
     pub last_seen: u64,
+    pub start_time_ns: u64,
+    pub cpu: u32,
+    // 4 bytes implicit trailing pad to 48-byte alignment
 }
 
 #[cfg(feature = "user")]

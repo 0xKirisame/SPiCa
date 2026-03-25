@@ -7,11 +7,15 @@
 mod vmlinux;
 use vmlinux::task_struct;
 
+// generated_keys.rs is written by spica/build.rs at compile time and gitignored.
+mod generated_keys;
+use generated_keys::BASE_KEY;
+
 use aya_ebpf::{
     macros::{btf_tracepoint, map, perf_event},
-    maps::{Array, RingBuf},
+    maps::RingBuf,
     programs::{BtfTracePointContext, PerfEventContext},
-    helpers::{bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_get_current_task},
+    helpers::{bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_get_current_task, bpf_get_smp_processor_id},
 };
 use spica_common::ProcessInfo;
 
@@ -26,12 +30,6 @@ static mut EVENTS_SCHED: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 /// RingBuf for NMI perf-event observations.
 #[map]
 static mut EVENTS_NMI: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
-
-/// Obfuscation key written by userspace at startup and rotated hourly.
-/// Low 32 bits XOR'd with pid, high 32 bits XOR'd with tgid.
-/// Prevents rootkit PID-bitmap filters from matching hidden PIDs in ring buffer output.
-#[map]
-static mut CONFIG: Array<u64> = Array::with_max_entries(1, 0);
 
 // ---------------------------------------------------------------------------
 // Program 1: sched_switch BTF tracepoint
@@ -59,6 +57,7 @@ fn try_sched(ctx: BtfTracePointContext) -> Result<u32, i64> {
     let pid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*next).pid as *const _)? } as u32;
     let tgid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*next).tgid as *const _)? } as u32;
     let comm: [u8; 16] = unsafe { core::mem::transmute(bpf_probe_read_kernel::<[i8; 16]>(&(*next).comm as *const _)?) };
+    let start_time_ns: u64 = unsafe { bpf_probe_read_kernel::<u64>(&(*next).start_time as *const _)? };
 
     // pid == 0 is the idle task; skip it.
     if pid == 0 {
@@ -67,15 +66,19 @@ fn try_sched(ctx: BtfTracePointContext) -> Result<u32, i64> {
 
     let time = unsafe { bpf_ktime_get_ns() };
 
-    // XOR pid/tgid with the runtime key before writing to the ring buffer.
-    // Any rootkit hook inspecting the output sees obfuscated values that won't
-    // match its hidden-PID bitmap — the event passes through unfiltered.
-    let key = unsafe { CONFIG.get(0) }.copied().unwrap_or(0);
+    // Per-CPU XOR key derived from the build-time BASE_KEY.
+    // Low 32 bits XOR'd with pid, high 32 bits XOR'd with tgid.
+    // Each CPU has a distinct key (BASE_KEY ^ cpu_id), forcing an attacker to
+    // extract N keys rather than one. No CONFIG map — key lives only in bytecode.
+    let cpu_id: u32 = unsafe { bpf_get_smp_processor_id() } as u32;
+    let key = BASE_KEY ^ (cpu_id as u64);
     let info = ProcessInfo {
         pid:  pid  ^ (key as u32),
         tgid: tgid ^ ((key >> 32) as u32),
         comm,
         last_seen: time,
+        start_time_ns,
+        cpu: cpu_id,
     };
 
     if let Some(mut entry) = unsafe { EVENTS_SCHED.reserve::<ProcessInfo>(0) } {
@@ -114,6 +117,7 @@ fn try_nmi(_ctx: PerfEventContext) -> Result<u32, i64> {
     let pid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*task).pid as *const _)? } as u32;
     let tgid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*task).tgid as *const _)? } as u32;
     let comm: [u8; 16] = unsafe { core::mem::transmute(bpf_probe_read_kernel::<[i8; 16]>(&(*task).comm as *const _)?) };
+    let start_time_ns: u64 = unsafe { bpf_probe_read_kernel::<u64>(&(*task).start_time as *const _)? };
 
     if pid == 0 {
         return Ok(0);
@@ -121,12 +125,15 @@ fn try_nmi(_ctx: PerfEventContext) -> Result<u32, i64> {
 
     let time = unsafe { bpf_ktime_get_ns() };
 
-    let key = unsafe { CONFIG.get(0) }.copied().unwrap_or(0);
+    let cpu_id: u32 = unsafe { bpf_get_smp_processor_id() } as u32;
+    let key = BASE_KEY ^ (cpu_id as u64);
     let info = ProcessInfo {
         pid:  pid  ^ (key as u32),
         tgid: tgid ^ ((key >> 32) as u32),
         comm,
         last_seen: time,
+        start_time_ns,
+        cpu: cpu_id,
     };
 
     if let Some(mut entry) = unsafe { EVENTS_NMI.reserve::<ProcessInfo>(0) } {

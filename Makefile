@@ -1,5 +1,6 @@
 # SPiCa Makefile
 # Run `make install-deps` and `make install-tools` once, then `make all` to build, `make run` to detect.
+# `make build` is self-contained: build.rs generates the XOR key and compiles the eBPF probe in one step.
 
 .PHONY: help install-deps install-tools generate-vmlinux build-ebpf build all run clean
 
@@ -10,9 +11,9 @@ help:
 	@echo "  install-deps       Install system dependencies (requires root)"
 	@echo "  install-tools      Install bpf-linker and aya-tool (run once)"
 	@echo "  generate-vmlinux   Generate BTF bindings for running kernel (run once per kernel update)"
-	@echo "  build-ebpf         Compile the eBPF kernel probe"
-	@echo "  build              Compile the userspace engine"
-	@echo "  all                Full pipeline: generate-vmlinux → build-ebpf → build"
+	@echo "  build-ebpf         Compile the eBPF kernel probe (dev/check only)"
+	@echo "  build              Compile everything: generates key, compiles eBPF + userspace"
+	@echo "  all                Full pipeline: generate-vmlinux → build"
 	@echo "  run                Run SPiCa (requires root)"
 	@echo "  clean              Remove build artifacts"
 	@echo ""
@@ -49,7 +50,7 @@ build-ebpf:
 build:
 	cargo build --release
 
-all: generate-vmlinux build-ebpf build
+all: generate-vmlinux build
 
 run:
 	sudo ./target/release/spica

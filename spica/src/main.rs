@@ -11,7 +11,6 @@ use spica_common::ProcessInfo;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::Path,
     time::{Duration, Instant},
 };
 use tokio::io::unix::AsyncFd;
@@ -19,162 +18,164 @@ use tokio::signal::unix::{signal, SignalKind};
 
 include!(concat!(env!("OUT_DIR"), "/keys.rs"));
 
-const TICK_RATE_MS: u64 = 100;
+const TICK_RATE_MS:           u64 = 100;
 const SUSPECT_THRESHOLD_SECS: u64 = 2;
-const GRACE_WINDOW_MS: u64 = 50;
-const ALERT_COOLDOWN_SECS: u64 = 30;
-const GHOST_THRESHOLD_SECS: u64 = 5;
+const GRACE_WINDOW_MS:        u64 = 50;
+const ALERT_COOLDOWN_SECS:    u64 = 30;
+const GHOST_THRESHOLD_SECS:   u64 = 5;
 const SILENCE_THRESHOLD_SECS: u64 = 10;
-// ── Detection logic ──────────────────────────────────────────────────────────
 
-// Observation maps store (first_seen, last_seen, start_time_ns).
-// first_seen:     used for grace window — don't alert on brand-new processes.
-// last_seen:      updated on every event — used for liveness and stale eviction.
-// start_time_ns:  task_struct->start_time at first real observation; mismatch = [DUPE].
-//                 0 means unknown (seeded entry — update on first real event, don't compare).
-type SeenMap = HashMap<u32, (Instant, Instant, u64)>;
+// ── Data model ────────────────────────────────────────────────────────────────
+
+struct AlertState {
+    last_dkom:   Option<Instant>,
+    last_tamper: Option<Instant>,
+    last_ghost:  Option<Instant>,
+}
+
+struct ProcessRecord {
+    start_time_ns:       u64,
+    first_seen:          Instant,
+    sched_last_seen:     Option<Instant>,
+    nmi_last_seen:       Option<Instant>,
+    dkom_suspect_since:  Option<Instant>,
+    ghost_suspect_since: Option<Instant>,
+    alerts:              AlertState,
+}
+
+type ProcessRegistry = HashMap<u32, ProcessRecord>;
 
 enum Channel { Sched, Nmi }
 
-fn process_event(
-    info: &ProcessInfo,
-    sched_seen: &mut SeenMap,
-    nmi_seen: &mut SeenMap,
-    suspects: &mut HashMap<u32, Instant>,
-    channel: Channel,
-) {
-    let tgid = info.tgid;
-    if tgid == 0 { return; }
+// ── Detection logic ───────────────────────────────────────────────────────────
+
+fn process_event(info: &ProcessInfo, registry: &mut ProcessRegistry, channel: Channel) {
+    if info.tgid == 0 { return; }
     let now = Instant::now();
-    let map = match channel {
-        Channel::Sched => &mut *sched_seen,
-        Channel::Nmi   => &mut *nmi_seen,
-    };
-    let mut dupe = false;
-    map.entry(tgid)
-        .and_modify(|e| {
-            e.1 = now;
-            if e.2 == 0 {
-                e.2 = info.start_time_ns;          // first real event for a seeded entry
-            } else if info.start_time_ns != 0 && e.2 != info.start_time_ns {
-                dupe = true;
-            }
-        })
-        .or_insert((now, now, info.start_time_ns));
-    if dupe {
-        println!("[DUPE]       tgid:{:<6} {:<16} task_struct spoofing suspected", tgid, resolve_comm(tgid));
+
+    let record = registry.entry(info.tgid).or_insert_with(|| ProcessRecord {
+        start_time_ns:       info.start_time_ns,
+        first_seen:          now,
+        sched_last_seen:     None,
+        nmi_last_seen:       None,
+        dkom_suspect_since:  None,
+        ghost_suspect_since: None,
+        alerts: AlertState { last_dkom: None, last_tamper: None, last_ghost: None },
+    });
+
+    // Anchor start_time on first real event for seeded (start_time_ns = 0) entries.
+    // On subsequent events, a mismatch means two structurally distinct processes
+    // are claiming the same TGID — task_struct field spoofing.
+    if record.start_time_ns == 0 && info.start_time_ns != 0 {
+        record.start_time_ns = info.start_time_ns;
+    } else if info.start_time_ns != 0 && record.start_time_ns != 0
+           && record.start_time_ns != info.start_time_ns {
+        println!("[DUPE]       tgid:{:<6} {:<16} task_struct spoofing suspected",
+            info.tgid, resolve_comm(info.tgid));
     }
-    if proc_has_tgid(tgid) {
-        suspects.remove(&tgid);
+
+    match channel {
+        Channel::Sched => record.sched_last_seen = Some(now),
+        Channel::Nmi   => record.nmi_last_seen   = Some(now),
     }
 }
 
-fn run_detection(
-    sched_seen: &mut SeenMap,
-    nmi_seen: &mut SeenMap,
-    suspects: &mut HashMap<u32, Instant>,
-    tamper_alerted: &mut HashMap<u32, Instant>,
-    dkom_alerted: &mut HashMap<u32, Instant>,
-    ghost_suspects: &mut HashMap<u32, Instant>,
-    ghost_alerted: &mut HashMap<u32, Instant>,
-) {
-    let user_tgids = read_proc_tgids();
-    let grace = Duration::from_millis(GRACE_WINDOW_MS);
+fn run_detection(registry: &mut ProcessRegistry) {
+    let user_tgids        = read_proc_tgids();
+    let grace             = Duration::from_millis(GRACE_WINDOW_MS);
     let suspect_threshold = Duration::from_secs(SUSPECT_THRESHOLD_SECS);
-    let cooldown = Duration::from_secs(ALERT_COOLDOWN_SECS);
-    let now = Instant::now();
+    let ghost_threshold   = Duration::from_secs(GHOST_THRESHOLD_SECS);
+    let cooldown          = Duration::from_secs(ALERT_COOLDOWN_SECS);
+    let stale             = Duration::from_secs(10);
+    let now               = Instant::now();
 
-    // [TAMPER]: NMI sees a process but sched_switch never has.
-    // Uses first_seen for grace (don't fire immediately on startup) and checks
-    // a per-tgid cooldown so the same process doesn't flood the alert log.
-    for (&tgid, &(nmi_first, _, _)) in nmi_seen.iter() {
-        if nmi_first.elapsed() < grace { continue; }
-        if !sched_seen.contains_key(&tgid) {
-            let should_alert = tamper_alerted.get(&tgid)
-                .map(|t| t.elapsed() > cooldown)
-                .unwrap_or(true);
-            if should_alert {
-                tamper_alerted.insert(tgid, now);
-                let comm = resolve_comm(tgid);
-                println!("[TAMPER]     tgid:{:<6} {:<16} sched_switch suppressed", tgid, comm);
-            }
-        } else {
-            // Process is now visible in sched_switch — clear any past tamper alert
-            // so it can be re-alerted if suppression starts again later.
-            tamper_alerted.remove(&tgid);
-        }
+    // Ensure /proc-only TGIDs have a registry entry so GHOST tracking can start.
+    for &tgid in &user_tgids {
+        registry.entry(tgid).or_insert_with(|| ProcessRecord {
+            start_time_ns:       0,
+            first_seen:          now,
+            sched_last_seen:     None,
+            nmi_last_seen:       None,
+            dkom_suspect_since:  None,
+            ghost_suspect_since: None,
+            alerts: AlertState { last_dkom: None, last_tamper: None, last_ghost: None },
+        });
     }
 
-    // [DKOM]: scan everything we've ever seen.
-    let all_tgids: HashSet<u32> = sched_seen.keys().chain(nmi_seen.keys()).copied().collect();
-    for tgid in all_tgids {
-        let (first_seen, _, _) = sched_seen.get(&tgid)
-            .or_else(|| nmi_seen.get(&tgid))
-            .copied()
-            .unwrap();
-        if first_seen.elapsed() < grace { continue; }
+    for (&tgid, record) in registry.iter_mut() {
+        if record.first_seen.elapsed() < grace { continue; }
 
-        if !user_tgids.contains(&tgid) {
-            // Use last_seen for liveness — a process is alive if it was observed
-            // recently, regardless of when it first appeared.
-            let alive = sched_seen.get(&tgid)
-                .map(|(_, last, _)| last.elapsed() < Duration::from_millis(500))
-                .unwrap_or(false)
-                || nmi_seen.get(&tgid)
-                    .map(|(_, last, _)| last.elapsed() < Duration::from_millis(500))
-                    .unwrap_or(false);
-            if !alive { continue; }
+        let in_proc    = user_tgids.contains(&tgid);
+        let sched_alive = record.sched_last_seen.map(|t| t.elapsed() < Duration::from_millis(500)).unwrap_or(false);
+        let nmi_alive   = record.nmi_last_seen  .map(|t| t.elapsed() < Duration::from_millis(500)).unwrap_or(false);
+        let ebpf_alive  = sched_alive || nmi_alive;
 
-            let entry = suspects.entry(tgid).or_insert(now);
-            if entry.elapsed() > suspect_threshold {
-                let should_alert = dkom_alerted.get(&tgid)
-                    .map(|t| t.elapsed() > cooldown)
-                    .unwrap_or(true);
+        // [TAMPER]: NMI has ever observed this TGID but sched_switch never has.
+        if record.nmi_last_seen.is_some() && record.sched_last_seen.is_none() {
+            let should_alert = record.alerts.last_tamper.map(|t| t.elapsed() > cooldown).unwrap_or(true);
+            if should_alert {
+                record.alerts.last_tamper = Some(now);
+                println!("[TAMPER]     tgid:{:<6} {:<16} sched_switch suppressed", tgid, resolve_comm(tgid));
+            }
+        } else {
+            record.alerts.last_tamper = None;
+        }
+
+        // [DKOM]: eBPF-active process absent from /proc.
+        if !in_proc && ebpf_alive {
+            let since = record.dkom_suspect_since.get_or_insert(now);
+            if since.elapsed() > suspect_threshold {
+                let should_alert = record.alerts.last_dkom.map(|t| t.elapsed() > cooldown).unwrap_or(true);
                 if should_alert {
-                    dkom_alerted.insert(tgid, now);
-                    let comm = resolve_comm(tgid);
-                    let duration = format!("{:.1}s", entry.elapsed().as_secs_f64());
-                    println!("[DKOM]       tgid:{:<6} {:<16} hidden {}", tgid, comm, duration);
+                    record.alerts.last_dkom = Some(now);
+                    println!("[DKOM]       tgid:{:<6} {:<16} hidden {:.1}s",
+                        tgid, resolve_comm(tgid), since.elapsed().as_secs_f64());
                 }
             }
         } else {
-            suspects.remove(&tgid);
-            dkom_alerted.remove(&tgid);
+            record.dkom_suspect_since = None;
+            record.alerts.last_dkom   = None;
         }
-    }
 
-    // Stale eviction: use last_seen so long-running processes aren't evicted.
-    let stale = Duration::from_secs(10);
-    sched_seen.retain(|_, (_, last, _)| last.elapsed() < stale);
-    nmi_seen.retain(|_, (_, last, _)| last.elapsed() < stale);
-    suspects.retain(|tgid, _| sched_seen.contains_key(tgid) || nmi_seen.contains_key(tgid));
-    tamper_alerted.retain(|tgid, _| nmi_seen.contains_key(tgid));
-    dkom_alerted.retain(|tgid, _| sched_seen.contains_key(tgid) || nmi_seen.contains_key(tgid));
-
-    // [GHOST]: TGID in /proc but never seen by either eBPF channel — /proc spoofing.
-    let ghost_threshold = Duration::from_secs(GHOST_THRESHOLD_SECS);
-    for &tgid in &user_tgids {
-        if !sched_seen.contains_key(&tgid) && !nmi_seen.contains_key(&tgid) {
-            ghost_suspects.entry(tgid).or_insert(now);
-        } else {
-            ghost_suspects.remove(&tgid);
-            ghost_alerted.remove(&tgid);
-        }
-    }
-    for (&tgid, &first) in ghost_suspects.iter() {
-        if first.elapsed() > ghost_threshold {
-            let should_alert = ghost_alerted.get(&tgid)
-                .map(|t| t.elapsed() > cooldown)
-                .unwrap_or(true);
-            if should_alert {
-                ghost_alerted.insert(tgid, now);
-                let comm = resolve_comm(tgid);
-                println!("[GHOST]      tgid:{:<6} {:<16} present in /proc, never seen by eBPF", tgid, comm);
+        // [GHOST]: in /proc but never observed by either eBPF channel.
+        if in_proc && record.sched_last_seen.is_none() && record.nmi_last_seen.is_none() {
+            let since = record.ghost_suspect_since.get_or_insert(now);
+            if since.elapsed() > ghost_threshold {
+                let should_alert = record.alerts.last_ghost.map(|t| t.elapsed() > cooldown).unwrap_or(true);
+                if should_alert {
+                    record.alerts.last_ghost = Some(now);
+                    println!("[GHOST]      tgid:{:<6} {:<16} present in /proc, never seen by eBPF",
+                        tgid, resolve_comm(tgid));
+                }
             }
+        } else {
+            record.ghost_suspect_since = None;
+            record.alerts.last_ghost   = None;
         }
     }
-    ghost_suspects.retain(|tgid, _| user_tgids.contains(tgid));
-    ghost_alerted.retain(|tgid, _| user_tgids.contains(tgid));
+
+    // Stale eviction: drop entries not recently active and no longer in /proc.
+    registry.retain(|&tgid, record| {
+        let sched_age = record.sched_last_seen.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
+        let nmi_age   = record.nmi_last_seen  .map(|t| t.elapsed()).unwrap_or(Duration::MAX);
+        sched_age < stale || nmi_age < stale || user_tgids.contains(&tgid)
+    });
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// ProcessInfo is defined in spica-common; inherent impl methods cannot be added
+// from outside the defining crate, so deobfuscation lives here as a free function.
+fn deobfuscate(raw: &ProcessInfo) -> ProcessInfo {
+    let key = BASE_KEY ^ (raw.cpu as u64);
+    ProcessInfo {
+        pid:          raw.pid  ^ (key as u32),
+        tgid:         raw.tgid ^ ((key >> 32) as u32),
+        comm:         raw.comm,
+        last_seen:    raw.last_seen,
+        start_time_ns: raw.start_time_ns,
+        cpu:          raw.cpu,
+    }
 }
 
 fn read_proc_tgids() -> HashSet<u32> {
@@ -189,10 +190,6 @@ fn read_proc_tgids() -> HashSet<u32> {
     set
 }
 
-fn proc_has_tgid(tgid: u32) -> bool {
-    Path::new(&format!("/proc/{}", tgid)).exists()
-}
-
 fn resolve_comm(tgid: u32) -> String {
     fs::read_to_string(format!("/proc/{}/comm", tgid))
         .unwrap_or_else(|_| "???".into())
@@ -200,7 +197,7 @@ fn resolve_comm(tgid: u32) -> String {
         .to_string()
 }
 
-// ── Entry point ──────────────────────────────────────────────────────────────
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -230,35 +227,36 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut sched_fd = AsyncFd::new(sched_rb)?;
     let mut nmi_fd   = AsyncFd::new(nmi_rb)?;
 
-    let mut sched_seen: SeenMap = HashMap::new();
-    let mut nmi_seen:   SeenMap = HashMap::new();
-    let mut suspects:   HashMap<u32, Instant> = HashMap::new();
-    let mut tamper_alerted: HashMap<u32, Instant> = HashMap::new();
-    let mut dkom_alerted:   HashMap<u32, Instant> = HashMap::new();
-    let mut ghost_suspects: HashMap<u32, Instant> = HashMap::new();
-    let mut ghost_alerted:  HashMap<u32, Instant> = HashMap::new();
-    let mut last_sched_event = Instant::now();
-    let mut last_nmi_event   = Instant::now();
+    let mut registry: ProcessRegistry = HashMap::new();
+    let mut last_sched_event          = Instant::now();
+    let mut last_nmi_event            = Instant::now();
     let mut sched_silent_alerted: Option<Instant> = None;
     let mut nmi_silent_alerted:   Option<Instant> = None;
 
-    // Seed sched_seen with all processes already running at startup.
-    // Without this, long-running processes (drivers, daemons) would appear in
-    // NMI immediately but not in sched_seen until their next context switch,
-    // causing spurious TAMPER alerts during the grace window.
-    // The seed also prevents GHOST false positives for pre-existing processes.
+    // Seed registry with all processes already running at startup.
+    // sched_last_seen is set to prevent spurious TAMPER alerts during the grace
+    // window — long-running processes appear in NMI before their next sched event.
+    // start_time_ns is 0 (unknown) and will be anchored on the first real eBPF event.
     let startup = Instant::now();
     for tgid in read_proc_tgids() {
-        sched_seen.insert(tgid, (startup, startup, 0));
+        registry.insert(tgid, ProcessRecord {
+            start_time_ns:       0,
+            first_seen:          startup,
+            sched_last_seen:     Some(startup),
+            nmi_last_seen:       None,
+            dkom_suspect_since:  None,
+            ghost_suspect_since: None,
+            alerts: AlertState { last_dkom: None, last_tamper: None, last_ghost: None },
+        });
     }
 
     println!("I'm going to sing, so shine bright, SPiCa...");
-    println!("SPiCa running — press Ctrl+C to quit");
 
-    // ── Main loop ────────────────────────────────────────────────────────────
+    // ── Main loop ─────────────────────────────────────────────────────────────
     let mut tick = tokio::time::interval(Duration::from_millis(TICK_RATE_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sigterm = signal(SignalKind::terminate())?;
+
     loop {
         tokio::select! {
             guard = sched_fd.readable_mut() => {
@@ -266,16 +264,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 let rb = guard.get_inner_mut();
                 while let Some(item) = rb.next() {
                     let raw = unsafe { &*(item.as_ptr() as *const ProcessInfo) };
-                    let key = BASE_KEY ^ (raw.cpu as u64);
-                    let info = ProcessInfo {
-                        pid:  raw.pid  ^ (key as u32),
-                        tgid: raw.tgid ^ ((key >> 32) as u32),
-                        comm: raw.comm,
-                        last_seen: raw.last_seen,
-                        start_time_ns: raw.start_time_ns,
-                        cpu: raw.cpu,
-                    };
-                    process_event(&info, &mut sched_seen, &mut nmi_seen, &mut suspects, Channel::Sched);
+                    process_event(&deobfuscate(raw), &mut registry, Channel::Sched);
                     last_sched_event = Instant::now();
                 }
                 guard.clear_ready();
@@ -285,30 +274,14 @@ async fn main() -> Result<(), anyhow::Error> {
                 let rb = guard.get_inner_mut();
                 while let Some(item) = rb.next() {
                     let raw = unsafe { &*(item.as_ptr() as *const ProcessInfo) };
-                    let key = BASE_KEY ^ (raw.cpu as u64);
-                    let info = ProcessInfo {
-                        pid:  raw.pid  ^ (key as u32),
-                        tgid: raw.tgid ^ ((key >> 32) as u32),
-                        comm: raw.comm,
-                        last_seen: raw.last_seen,
-                        start_time_ns: raw.start_time_ns,
-                        cpu: raw.cpu,
-                    };
-                    process_event(&info, &mut sched_seen, &mut nmi_seen, &mut suspects, Channel::Nmi);
+                    process_event(&deobfuscate(raw), &mut registry, Channel::Nmi);
                     last_nmi_event = Instant::now();
                 }
                 guard.clear_ready();
             }
             _ = tick.tick() => {
-                run_detection(
-                    &mut sched_seen, &mut nmi_seen, &mut suspects,
-                    &mut tamper_alerted, &mut dkom_alerted,
-                    &mut ghost_suspects, &mut ghost_alerted,
-                );
+                run_detection(&mut registry);
                 // [SILENT]: one channel dark while the other is alive.
-                // Catches perf_event struct DKOM, eBPF detachment, and
-                // consumer pointer manipulation — all produce this symptom.
-                // Guard with startup elapsed so we don't fire during warmup.
                 let silence  = Duration::from_secs(SILENCE_THRESHOLD_SECS);
                 let cooldown = Duration::from_secs(ALERT_COOLDOWN_SECS);
                 if startup.elapsed() > silence {
@@ -337,7 +310,7 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    println!("[SPICA] SPiCa killed (code \"catch me! I'll leap over denebola\")");
+    println!("Catch me! I'll leap over Denebola");
 
     Ok(())
 }

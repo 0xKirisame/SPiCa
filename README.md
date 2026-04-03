@@ -9,11 +9,11 @@
 
 SPiCa is a high-performance, eBPF-based rootkit detection engine written in Rust. The name comes from two places at once: the Hatsune Miku song *SPiCa*, and the real star it is named after — Spica (Alpha Virginis), the brightest star in Virgo. Spica is not a single star. It is a **spectroscopic binary**: two massive stars locked in a mutual orbit so tight they are pulled into egg shapes by each other's gravity, completing a full revolution every four days, indistinguishable to the naked eye as anything other than one.
 
+> **⚠️ Disclaimer:** Significant portions of this codebase were generated or refactored using Claude Code. While rigorous testing and iterative trial and error were conducted to ensure accuracy and architectural integrity, the code should still be reviewed for security and performance before production use.
+
 SPiCa the detector is built on the same principle. It is architecturally a **binary star**: two independent observation channels orbiting the same process space, each anchored to a different physical mechanism, forming a detection system that cannot be silenced by attacking a single channel.
 
 SPiCa enforces **Kernel Sovereignty** by establishing ground truth from CPU execution events and direct kernel memory reads (BTF/CO-RE), deliberately bypassing helper functions that a rootkit can hook.
-
-## Architecture
 
 SPiCa maintains two independent observational channels and a userspace differential engine:
 

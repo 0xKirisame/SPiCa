@@ -25,13 +25,13 @@ help:
 
 install-deps:
 	@if command -v pacman >/dev/null 2>&1; then \
-		sudo pacman -S --needed --noconfirm base-devel clang llvm libelf bpf; \
+		sudo pacman -S --needed --noconfirm base-devel clang llvm libelf bpf tpm2-tools ima-evm-utils; \
 	elif command -v apt-get >/dev/null 2>&1; then \
-		sudo apt-get update && sudo apt-get install -y build-essential clang llvm libelf-dev linux-tools-common bpftool; \
+		sudo apt-get update && sudo apt-get install -y build-essential clang llvm libelf-dev linux-tools-common bpftool tpm2-tools ima-evm-utils; \
 	elif command -v dnf >/dev/null 2>&1; then \
-		sudo dnf install -y clang llvm elfutils-libelf-devel bpftool; \
+		sudo dnf install -y clang llvm elfutils-libelf-devel bpftool tpm2-tools ima-evm-utils; \
 	else \
-		echo "Unsupported package manager. Install clang, llvm, libelf, and bpftool manually."; \
+		echo "Unsupported package manager. Install clang, llvm, libelf, bpftool, tpm2-tools, and ima-evm-utils manually."; \
 		exit 1; \
 	fi
 	rustup toolchain install nightly --component rust-src

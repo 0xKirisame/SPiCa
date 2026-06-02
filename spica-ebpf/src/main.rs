@@ -7,38 +7,108 @@
 mod vmlinux;
 use vmlinux::task_struct;
 
-// generated_keys.rs is written by spica/build.rs at compile time and gitignored.
-mod generated_keys;
-use generated_keys::BASE_KEY;
-
 use aya_ebpf::{
-    macros::{btf_tracepoint, map, perf_event},
-    maps::RingBuf,
-    programs::{BtfTracePointContext, PerfEventContext},
-    helpers::{bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_get_current_task, bpf_get_smp_processor_id},
+    macros::{btf_tracepoint, lsm, map, perf_event, tracepoint, xdp},
+    maps::{Array, RingBuf},
+    programs::{BtfTracePointContext, LsmContext, PerfEventContext, TracePointContext, XdpContext},
+    helpers::{
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_smp_processor_id,
+        bpf_ktime_get_ns, bpf_probe_read_kernel,
+    },
+    bindings::xdp_action,
 };
-use spica_common::ProcessInfo;
+use spica_common::{LkmEvent, ProcessInfo};
 
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "license")]
 pub static _license: [u8; 4] = *b"GPL\0";
 
-/// RingBuf for sched_switch BTF tracepoint events.
-#[map]
-static mut EVENTS_SCHED: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+// ── .bss globals ─────────────────────────────────────────────────────────────
+//
+// None of these appear in the bpf() map enumeration interface.
+// Singularity's bpf_map_lookup_elem / bpf_map_update_elem hooks cannot reach them.
+// Finding them requires scanning kernel virtual memory from an address the verifier
+// never gives Singularity — undecidable by Rice's theorem at eBPF capability level.
+//
+// All written by userspace via set_global() before programs are loaded into the kernel.
 
-/// RingBuf for NMI perf-event observations.
-#[map]
-static mut EVENTS_NMI: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+/// XOR obfuscation key. TPM-sourced at runtime; compile-time fallback for VMs.
+static mut BASE_KEY: u64 = 0u64;
 
-// ---------------------------------------------------------------------------
-// Program 1: sched_switch BTF tracepoint
+/// SPiCa's own TGID, written before load so the watchdog program needs no map.
+static mut SPICA_PID: u32 = 0u32;
+
+/// Integrity canary expected value. NMI compares sc_canary[0] against this.
+/// Singularity can intercept the sc_canary map write but cannot forge this value
+/// without BASE_KEY, which it cannot discover from .bss at eBPF privilege level.
+static mut INTEGRITY_TOKEN: u64 = 0u64;
+
+// ── Named maps — minimal, opaque names ───────────────────────────────────────
+//
+// Only types that .bss cannot provide: ring buffers, a post-load-writable gate,
+// a pinneable watchdog flag, and the integrity canary target.
+
+/// Sched-switch event stream to userspace.
+#[map]
+static mut sc_sched: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// NMI heartbeat event stream to userspace.
+#[map]
+static mut sc_nmi: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// LSM module-load gate: 0 = allow (init window), 1 = block all new LKMs.
+/// Separate map because it must be written by userspace after program load.
+#[map]
+static sc_gate: Array<u32> = Array::with_max_entries(1, 0);
+
+/// XDP network-block gate: 0 = drop all incoming packets, 1 = pass all traffic.
+/// Set to 1 by userspace once early boot init and process seeding are complete.
+#[map]
+static sc_net_gate: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Forensic kill flag. Pinned to BPF-FS; survives SIGKILL.
+/// Must be a named map — .bss globals cannot be pinned to the filesystem.
+#[map]
+static mut sc_wd: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Integrity canary. Userspace writes INTEGRITY_TOKEN here after load.
+/// The NMI reads this and compares to the .bss copy. If Singularity intercepts
+/// the write via bpf_map_update_elem, the values diverge and [TAMPER] fires.
+#[map]
+static sc_canary: Array<u64> = Array::with_max_entries(1, 0);
+
+/// LKM load audit log. Emitted on every READING_MODULE attempt (allowed or denied).
+/// Gives userspace visibility into which modules ran (boot window) and which were
+/// blocked (post-gate). Not obfuscated — comm/pid carry no secret.
+#[map]
+static mut sc_lsm: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+// ── Shared obfuscation ────────────────────────────────────────────────────────
+
+#[inline(always)]
+fn obfuscate(info: &mut ProcessInfo, key: u64) {
+    info.pid ^= key as u32;
+    info.tgid ^= (key >> 32) as u32;
+    info.last_seen ^= key;
+    info.start_time_ns ^= key;
+    info.cpu ^= key as u32;
+    let kb = key.to_ne_bytes();
+    for i in 0..8 {
+        info.comm[i] ^= kb[i];
+        info.comm[i + 8] ^= kb[i];
+    }
+    // event_type is intentionally not obfuscated: userspace reads it as a sentinel
+    // before deobfuscating the rest. Singularity filtering on event_type==1 still
+    // loses — NMI heartbeat absence triggers [TAMPER] independently.
+}
+
+// ── Program 1: sched_switch BTF tracepoint ────────────────────────────────────
 //
 // BTF signature: (bool preempt, struct task_struct *prev, struct task_struct *next)
-// We read `next` (arg index 2) via CO-RE to get the process being scheduled IN.
-// This avoids bpf_get_current_pid_tgid() / bpf_get_current_comm() which return
-// the *outgoing* task at sched_switch time and are attackable via hooking.
-// ---------------------------------------------------------------------------
+// We read `next` (arg 2) via CO-RE to get the task being scheduled IN.
+// Avoids bpf_get_current_pid_tgid() / bpf_get_current_comm() which return the
+// *outgoing* task at sched_switch time and are themselves hookable by LKMs.
+
 #[btf_tracepoint(function = "sched_switch")]
 pub fn spica_sched(ctx: BtfTracePointContext) -> u32 {
     match try_sched(ctx) {
@@ -48,44 +118,50 @@ pub fn spica_sched(ctx: BtfTracePointContext) -> u32 {
 }
 
 fn try_sched(ctx: BtfTracePointContext) -> Result<u32, i64> {
-    // arg(2) = *next (task being scheduled in)
     let next: *const task_struct = unsafe { ctx.arg(2) };
     if next.is_null() {
         return Ok(0);
     }
 
-    let pid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*next).pid as *const _)? } as u32;
-    let tgid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*next).tgid as *const _)? } as u32;
-    let comm: [u8; 16] = unsafe { core::mem::transmute(bpf_probe_read_kernel::<[i8; 16]>(&(*next).comm as *const _)?) };
-    // Read start_time from the group leader (main thread), not the current thread.
-    // All threads in a process share the same tgid but have distinct per-thread start_times.
-    // group_leader->start_time is the stable process birth timestamp.
-    let group_leader = unsafe { bpf_probe_read_kernel::<u64>(&(*next).group_leader as *const _ as *const u64)? } as *const task_struct;
-    let start_time_ns: u64 = unsafe { bpf_probe_read_kernel::<u64>(&(*group_leader).start_time as *const _)? };
-
-    // pid == 0 is the idle task; skip it.
+    let pid: u32 =
+        unsafe { bpf_probe_read_kernel::<i32>(&(*next).pid as *const _)? } as u32;
     if pid == 0 {
-        return Ok(0);
+        return Ok(0); // idle task
     }
 
-    let time = unsafe { bpf_ktime_get_ns() };
-
-    // Per-CPU XOR key derived from the build-time BASE_KEY.
-    // Low 32 bits XOR'd with pid, high 32 bits XOR'd with tgid.
-    // Each CPU has a distinct key (BASE_KEY ^ cpu_id), forcing an attacker to
-    // extract N keys rather than one. No CONFIG map — key lives only in bytecode.
-    let cpu_id: u32 = unsafe { bpf_get_smp_processor_id() } as u32;
-    let key = BASE_KEY ^ (cpu_id as u64);
-    let info = ProcessInfo {
-        pid:  pid  ^ (key as u32),
-        tgid: tgid ^ ((key >> 32) as u32),
-        comm,
-        last_seen: time,
-        start_time_ns,
-        cpu: cpu_id,
+    let tgid: u32 =
+        unsafe { bpf_probe_read_kernel::<i32>(&(*next).tgid as *const _)? } as u32;
+    let comm: [u8; 16] = unsafe {
+        core::mem::transmute(
+            bpf_probe_read_kernel::<[i8; 16]>(&(*next).comm as *const _)?,
+        )
     };
 
-    if let Some(mut entry) = unsafe { EVENTS_SCHED.reserve::<ProcessInfo>(0) } {
+    // group_leader->start_time is the stable process birth timestamp shared by all
+    // threads in the TGID. Per-thread start_times differ; we want the group one.
+    let group_leader = unsafe {
+        bpf_probe_read_kernel::<u64>(
+            &(*next).group_leader as *const _ as *const u64,
+        )?
+    } as *const task_struct;
+    let start_time_ns: u64 =
+        unsafe { bpf_probe_read_kernel::<u64>(&(*group_leader).start_time as *const _)? };
+
+    let cpu_id = unsafe { bpf_get_smp_processor_id() } as u32;
+    let key = unsafe { BASE_KEY };
+
+    let mut info = ProcessInfo {
+        pid,
+        tgid,
+        comm,
+        last_seen: unsafe { bpf_ktime_get_ns() },
+        start_time_ns,
+        cpu: cpu_id,
+        event_type: 0,
+    };
+    obfuscate(&mut info, key);
+
+    if let Some(mut entry) = unsafe { sc_sched.reserve::<ProcessInfo>(0) } {
         entry.write(info);
         entry.submit(0);
     }
@@ -93,18 +169,20 @@ fn try_sched(ctx: BtfTracePointContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-// ---------------------------------------------------------------------------
-// Program 2: NMI perf-event (hardware CPU cycle counter)
+// ── Program 2: Hardware NMI perf event ───────────────────────────────────────
 //
-// Fired via Non-Maskable Interrupt — cannot be masked by `cli` or RFLAGS.IF.
-// Requires PMU hardware reprogramming to suppress, making it a second,
-// independent observation channel resistant to software-only hooking attacks.
+// Fired by the hardware PMU at a fixed frequency (~100 Hz). NMIs cannot be
+// disabled with `cli` — suppressing them requires reprogramming the PMU, which
+// is a loud and destabilising operation. Provides a hardware-level heartbeat
+// independent of the sched_switch software path.
 //
-// At NMI context, bpf_get_current_task() correctly identifies the interrupted
-// task. This is not subject to the same execution-context spoofing that
-// bpf_get_current_pid_tgid() is vulnerable to at tracepoint context.
-// ---------------------------------------------------------------------------
-#[perf_event]
+// Also performs the integrity canary check: compares sc_canary[0] (a named map
+// that Singularity's map hooks could have tampered with) against INTEGRITY_TOKEN
+// in .bss (which Singularity cannot read or forge). Runs at hardware interrupt
+// level with no process PID context, so Singularity's __bpf_prog_run filter
+// ("block execution when running in hidden process context") never matches.
+
+#[perf_event(name = "spica_nmi")]
 pub fn spica_nmi(ctx: PerfEventContext) -> u32 {
     match try_nmi(ctx) {
         Ok(ret) => ret,
@@ -113,40 +191,157 @@ pub fn spica_nmi(ctx: PerfEventContext) -> u32 {
 }
 
 fn try_nmi(_ctx: PerfEventContext) -> Result<u32, i64> {
-    let task = unsafe { bpf_get_current_task() as *const task_struct };
-    if task.is_null() {
+    let cpu_id = unsafe { bpf_get_smp_processor_id() } as u32;
+    let key = unsafe { BASE_KEY };
+
+    // Integrity check runs unconditionally once INTEGRITY_TOKEN is set.
+    let token_bss = unsafe { INTEGRITY_TOKEN };
+    if token_bss != 0 {
+        let canary_val = unsafe { sc_canary.get(0).copied().unwrap_or(0) };
+        if canary_val != token_bss {
+            // sc_canary was tampered with (Singularity intercepted the map write).
+            // Emit a sentinel event so userspace can fire [TAMPER].
+            let mut alert = ProcessInfo {
+                pid: 0,
+                tgid: 0,
+                comm: [0u8; 16],
+                last_seen: unsafe { bpf_ktime_get_ns() },
+                start_time_ns: 0,
+                cpu: cpu_id,
+                event_type: 1,
+            };
+            // Obfuscate the non-sentinel fields so the event looks like noise.
+            alert.last_seen ^= key;
+            alert.cpu ^= key as u32;
+            if let Some(mut entry) = unsafe { sc_nmi.reserve::<ProcessInfo>(0) } {
+                entry.write(alert);
+                entry.submit(0);
+            }
+            return Ok(0);
+        }
+    }
+
+    let pid_tgid = unsafe { bpf_get_current_pid_tgid() };
+    let pid = (pid_tgid & 0xFFFF_FFFF) as u32;
+    let tgid = (pid_tgid >> 32) as u32;
+    if tgid == 0 {
         return Ok(0);
     }
 
-    let pid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*task).pid as *const _)? } as u32;
-    let tgid: u32 = unsafe { bpf_probe_read_kernel::<i32>(&(*task).tgid as *const _)? } as u32;
-    let comm: [u8; 16] = unsafe { core::mem::transmute(bpf_probe_read_kernel::<[i8; 16]>(&(*task).comm as *const _)?) };
-    let group_leader = unsafe { bpf_probe_read_kernel::<u64>(&(*task).group_leader as *const _ as *const u64)? } as *const task_struct;
-    let start_time_ns: u64 = unsafe { bpf_probe_read_kernel::<u64>(&(*group_leader).start_time as *const _)? };
+    let mut comm = [0u8; 16];
+    unsafe { bpf_get_current_comm(&mut comm as *mut [u8; 16]) };
 
-    if pid == 0 {
-        return Ok(0);
-    }
-
-    let time = unsafe { bpf_ktime_get_ns() };
-
-    let cpu_id: u32 = unsafe { bpf_get_smp_processor_id() } as u32;
-    let key = BASE_KEY ^ (cpu_id as u64);
-    let info = ProcessInfo {
-        pid:  pid  ^ (key as u32),
-        tgid: tgid ^ ((key >> 32) as u32),
+    let mut info = ProcessInfo {
+        pid,
+        tgid,
         comm,
-        last_seen: time,
-        start_time_ns,
+        last_seen: unsafe { bpf_ktime_get_ns() },
+        start_time_ns: 0,
         cpu: cpu_id,
+        event_type: 0,
     };
+    obfuscate(&mut info, key);
 
-    if let Some(mut entry) = unsafe { EVENTS_NMI.reserve::<ProcessInfo>(0) } {
+    if let Some(mut entry) = unsafe { sc_nmi.reserve::<ProcessInfo>(0) } {
         entry.write(info);
         entry.submit(0);
     }
 
     Ok(0)
+}
+
+// ── Program 3: BPF LSM — block kernel module loading after init window ────────
+//
+// kernel_read_file(struct file *file, enum kernel_read_file_id id, bool contents)
+// READING_MODULE = 2. sc_gate[0] is set to 1 by userspace after the init window.
+// Hook detaches automatically when SPiCa exits, restoring normal module loading.
+
+#[lsm(hook = "kernel_read_file")]
+pub fn spica_lsm_modblock(ctx: LsmContext) -> i32 {
+    match try_lsm_modblock(ctx) {
+        Ok(r) => r,
+        Err(_) => 0,
+    }
+}
+
+fn try_lsm_modblock(ctx: LsmContext) -> Result<i32, i64> {
+    let file_id: u32 = unsafe { ctx.arg(1) };
+    if file_id != 2 {
+        return Ok(0);
+    }
+
+    let gate_val = unsafe { sc_gate.get(0).copied().unwrap_or(0) };
+    let allowed: u32 = if gate_val == 1 { 0 } else { 1 };
+
+    // current IS the process calling insmod/modprobe here — safe to use helpers.
+    let pid_tgid = unsafe { bpf_get_current_pid_tgid() };
+    let pid  = (pid_tgid & 0xFFFF_FFFF) as u32;
+    let tgid = (pid_tgid >> 32) as u32;
+    let mut comm = [0u8; 16];
+    unsafe { bpf_get_current_comm(&mut comm as *mut [u8; 16]) };
+
+    let event = LkmEvent {
+        pid,
+        tgid,
+        comm,
+        ktime_ns: unsafe { bpf_ktime_get_ns() },
+        allowed,
+        _pad: 0,
+    };
+    if let Some(mut entry) = unsafe { sc_lsm.reserve::<LkmEvent>(0) } {
+        entry.write(event);
+        entry.submit(0);
+    }
+
+    if gate_val == 1 { Ok(-1) } else { Ok(0) }
+}
+
+// ── Program 4: sched_process_exit watchdog ────────────────────────────────────
+//
+// SPICA_PID is written to .bss by userspace before the programs are loaded, so
+// no map lookup is needed here. bpf_get_current_pid_tgid() is safe at
+// sched_process_exit because "current" IS the dying process, not a scheduling
+// artifact. sc_wd is pinned to BPF-FS by userspace; the pin outlives SIGKILL.
+
+#[tracepoint(name = "sched_process_exit")]
+pub fn spica_watchdog(ctx: TracePointContext) -> u32 {
+    match try_watchdog(ctx) {
+        Ok(r) | Err(r) => r as u32,
+    }
+}
+
+fn try_watchdog(_ctx: TracePointContext) -> Result<u32, i64> {
+    let pid_tgid = unsafe { bpf_get_current_pid_tgid() };
+    let tgid = (pid_tgid >> 32) as u32;
+    let spica_tgid = unsafe { SPICA_PID };
+    if spica_tgid != 0 && tgid == spica_tgid {
+        if let Some(flag) = unsafe { sc_wd.get_ptr_mut(0) } {
+            unsafe { *flag = 1 };
+        }
+    }
+    Ok(0)
+}
+
+// Program 5: XDP Packet Dropper
+//
+// Fired on every incoming network packet at the driver level (RX/ingress).
+// Drops all traffic (C2 signaling, inbound payloads) until the LKM gate is locked
+// (sc_gate[0] == 1) to prevent remote triggers before Ring 0 is secured.
+#[xdp]
+pub fn spica_xdp(ctx: XdpContext) -> u32 {
+    match try_xdp(ctx) {
+        Ok(r) => r,
+        Err(_) => xdp_action::XDP_ABORTED,
+    }
+}
+
+fn try_xdp(_ctx: XdpContext) -> Result<u32, i64> {
+    let net_gate_val = unsafe { sc_net_gate.get(0).copied().unwrap_or(0) };
+    if net_gate_val == 0 {
+        Ok(xdp_action::XDP_DROP)
+    } else {
+        Ok(xdp_action::XDP_PASS)
+    }
 }
 
 #[panic_handler]

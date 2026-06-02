@@ -3,20 +3,18 @@ use aya_build::Toolchain;
 use std::{fs, io::Read};
 
 fn main() -> anyhow::Result<()> {
-    // Generate a build-time XOR key and write it to both the eBPF crate and
-    // the userspace crate's OUT_DIR. No runtime CONFIG map needed.
+    // Generate a compile-time fallback XOR key for use when no TPM is present.
+    // The eBPF program receives the active key via set_global() at load time.
     let mut buf = [0u8; 8];
     fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
     let base_key: u64 = u64::from_ne_bytes(buf);
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    fs::write(
-        format!("{manifest_dir}/../spica-ebpf/src/generated_keys.rs"),
-        format!("pub const BASE_KEY: u64 = {:#018x};\n", base_key),
-    )?;
     let out_dir = std::env::var("OUT_DIR").unwrap();
+    // Fallback key used when TPM is unavailable (VMs, containers, no TPM chip).
+    // The eBPF program receives the active key via set_global() before load,
+    // so this constant is only used by userspace as a fallback for deobfuscation.
     fs::write(
         format!("{out_dir}/keys.rs"),
-        format!("const BASE_KEY: u64 = {:#018x};\n", base_key),
+        format!("const COMPILE_TIME_BASE_KEY: u64 = {:#018x};\n", base_key),
     )?;
 
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()

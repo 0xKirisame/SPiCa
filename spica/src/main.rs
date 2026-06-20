@@ -217,26 +217,6 @@ fn run_detection(registry: &mut ProcessRegistry) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn deobfuscate(raw: &ProcessInfo, base_key: u64) -> ProcessInfo {
-    let key = base_key;
-    let mut info = *raw;
-
-    info.pid ^= key as u32;
-    info.tgid ^= (key >> 32) as u32;
-    info.last_seen ^= key;
-    info.start_time_ns ^= key;
-    info.cpu ^= key as u32;
-
-    let k_bytes = key.to_ne_bytes();
-    for i in 0..8 {
-        info.comm[i] ^= k_bytes[i];
-        info.comm[i + 8] ^= k_bytes[i];
-    }
-
-    // event_type is never obfuscated; copy as-is.
-    info
-}
-
 fn read_proc_tgids() -> HashSet<u32> {
     let mut set = HashSet::new();
     if let Ok(entries) = fs::read_dir("/proc") {
@@ -551,7 +531,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     let raw = unsafe { &*(item.as_ptr() as *const ProcessInfo) };
                     // event_type is read before deobfuscation (it is never XOR'd).
                     if raw.event_type == 0 {
-                        process_event(&deobfuscate(raw, base_key), &mut registry, false);
+                        let mut info = *raw;
+                        spica_common::xor_fields(&mut info, base_key);
+                        process_event(&info, &mut registry, false);
                     }
                 }
                 guard.clear_ready();
@@ -566,7 +548,9 @@ async fn main() -> Result<(), anyhow::Error> {
                         // the bpf_map_update_elem call for the integrity canary.
                         println!("[TAMPER]     BPF map integrity check failed — sc_canary intercepted");
                     } else {
-                        process_event(&deobfuscate(raw, base_key), &mut registry, true);
+                        let mut info = *raw;
+                        spica_common::xor_fields(&mut info, base_key);
+                        process_event(&info, &mut registry, true);
                     }
                 }
                 guard.clear_ready();

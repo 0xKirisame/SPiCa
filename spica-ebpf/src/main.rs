@@ -84,23 +84,9 @@ static sc_canary: Array<u64> = Array::with_max_entries(1, 0);
 static mut sc_lsm: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 // ── Shared obfuscation ────────────────────────────────────────────────────────
-
-#[inline(always)]
-fn obfuscate(info: &mut ProcessInfo, key: u64) {
-    info.pid ^= key as u32;
-    info.tgid ^= (key >> 32) as u32;
-    info.last_seen ^= key;
-    info.start_time_ns ^= key;
-    info.cpu ^= key as u32;
-    let kb = key.to_ne_bytes();
-    for i in 0..8 {
-        info.comm[i] ^= kb[i];
-        info.comm[i + 8] ^= kb[i];
-    }
-    // event_type is intentionally not obfuscated: userspace reads it as a sentinel
-    // before deobfuscating the rest. Singularity filtering on event_type==1 still
-    // loses — NMI heartbeat absence triggers [TAMPER] independently.
-}
+//
+// xor_fields lives in spica-common and is shared with userspace. Single source
+// of truth — both sides of the wire stay in sync. See spica_common::xor_fields.
 
 // ── Program 1: sched_switch BTF tracepoint ────────────────────────────────────
 //
@@ -159,7 +145,7 @@ fn try_sched(ctx: BtfTracePointContext) -> Result<u32, i64> {
         cpu: cpu_id,
         event_type: 0,
     };
-    obfuscate(&mut info, key);
+    spica_common::xor_fields(&mut info, key);
 
     if let Some(mut entry) = unsafe { sc_sched.reserve::<ProcessInfo>(0) } {
         entry.write(info);
@@ -240,7 +226,7 @@ fn try_nmi(_ctx: PerfEventContext) -> Result<u32, i64> {
         cpu: cpu_id,
         event_type: 0,
     };
-    obfuscate(&mut info, key);
+    spica_common::xor_fields(&mut info, key);
 
     if let Some(mut entry) = unsafe { sc_nmi.reserve::<ProcessInfo>(0) } {
         entry.write(info);

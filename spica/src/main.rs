@@ -2,7 +2,7 @@
 
 use aya::{include_bytes_aligned, Bpf, Btf, util};
 use aya::maps::{Array, RingBuf};
-use aya::programs::{BtfTracePoint, Lsm, PerfEvent, TracePoint, Xdp, XdpFlags, perf_event};
+use aya::programs::{BtfTracePoint, Lsm, PerfEvent, TracePoint, perf_event};
 use siphasher::sip::SipHasher13;
 use spica_common::{LkmEvent, ProcessInfo};
 use std::{
@@ -431,32 +431,6 @@ async fn main() -> Result<(), anyhow::Error> {
     watchdog_prog.load()?;
     watchdog_prog.attach("sched", "sched_process_exit")?;
 
-    // Load and attach XDP program to block incoming traffic during initialization window
-    let xdp_prog: &mut Xdp = bpf.program_mut("spica_xdp").unwrap().try_into()?;
-    xdp_prog.load()?;
-    
-    let mut attached_ifaces = Vec::new();
-    if let Ok(entries) = fs::read_dir("/sys/class/net") {
-        for entry in entries.flatten() {
-            let iface = entry.file_name().to_string_lossy().into_owned();
-            if iface != "lo" {
-                match xdp_prog.attach(&iface, XdpFlags::default()) {
-                    Ok(_link) => {
-                        attached_ifaces.push(iface);
-                    }
-                    Err(e) => {
-                        eprintln!("[XDP]        Failed to attach packet drop to interface {}: {:?}", iface, e);
-                    }
-                }
-            }
-        }
-    }
-    if !attached_ifaces.is_empty() {
-        println!("[XDP]        Early boot network blocking active on interfaces: {:?}", attached_ifaces);
-    } else {
-        println!("[XDP]        No active network interfaces attached for blocking.");
-    }
-
     // Write the integrity canary BEFORE attaching the NMI program.
     // sc_canary exists as soon as Bpf::load() runs (maps are created then).
     // If we wrote it after nmi_prog.attach(), the NMI could fire in the gap
@@ -507,13 +481,6 @@ async fn main() -> Result<(), anyhow::Error> {
                 last_dkom: None, last_ghost: None, last_tamper: None, last_silent: None,
             },
         });
-    }
-
-    // Seeding process registry completed. Unlock network traffic!
-    {
-        let mut net_gate: Array<_, u32> = bpf.map_mut("sc_net_gate").unwrap().try_into()?;
-        net_gate.set(0, 1u32, 0)?;
-        println!("[XDP]        System initialized; network blocking disarmed.");
     }
 
     println!("I'm going to sing, so shine bright, SPiCa...");

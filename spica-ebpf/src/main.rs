@@ -8,14 +8,13 @@ mod vmlinux;
 use vmlinux::task_struct;
 
 use aya_ebpf::{
-    macros::{btf_tracepoint, lsm, map, perf_event, tracepoint, xdp},
+    macros::{btf_tracepoint, lsm, map, perf_event, tracepoint},
     maps::{Array, RingBuf},
-    programs::{BtfTracePointContext, LsmContext, PerfEventContext, TracePointContext, XdpContext},
+    programs::{BtfTracePointContext, LsmContext, PerfEventContext, TracePointContext},
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_smp_processor_id,
         bpf_ktime_get_ns, bpf_probe_read_kernel,
     },
-    bindings::xdp_action,
 };
 use spica_common::{LkmEvent, ProcessInfo};
 
@@ -60,11 +59,6 @@ static mut sc_nmi: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 /// Separate map because it must be written by userspace after program load.
 #[map]
 static sc_gate: Array<u32> = Array::with_max_entries(1, 0);
-
-/// XDP network-block gate: 0 = drop all incoming packets, 1 = pass all traffic.
-/// Set to 1 by userspace once early boot init and process seeding are complete.
-#[map]
-static sc_net_gate: Array<u32> = Array::with_max_entries(1, 0);
 
 /// Forensic kill flag. Pinned to BPF-FS; survives SIGKILL.
 /// Must be a named map — .bss globals cannot be pinned to the filesystem.
@@ -306,28 +300,6 @@ fn try_watchdog(_ctx: TracePointContext) -> Result<u32, i64> {
         }
     }
     Ok(0)
-}
-
-// Program 5: XDP Packet Dropper
-//
-// Fired on every incoming network packet at the driver level (RX/ingress).
-// Drops all traffic (C2 signaling, inbound payloads) until the LKM gate is locked
-// (sc_gate[0] == 1) to prevent remote triggers before Ring 0 is secured.
-#[xdp]
-pub fn spica_xdp(ctx: XdpContext) -> u32 {
-    match try_xdp(ctx) {
-        Ok(r) => r,
-        Err(_) => xdp_action::XDP_ABORTED,
-    }
-}
-
-fn try_xdp(_ctx: XdpContext) -> Result<u32, i64> {
-    let net_gate_val = unsafe { sc_net_gate.get(0).copied().unwrap_or(0) };
-    if net_gate_val == 0 {
-        Ok(xdp_action::XDP_DROP)
-    } else {
-        Ok(xdp_action::XDP_PASS)
-    }
 }
 
 #[panic_handler]

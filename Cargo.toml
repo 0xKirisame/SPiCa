@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "spica",
     "spica-common",
+    "spica-detect",
     "spica-ebpf",
     "xtask",
 ]

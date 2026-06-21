@@ -1,0 +1,11 @@
+[package]
+name = "spica-detect"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spica-common = { path = "../spica-common" }
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,16 @@
+[package]
+name = "spica-key"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+siphasher = { workspace = true }
+
+# TPM 2.0 hardware key source. Linux-only — wraps libtss2-esys which doesn't
+# exist on macOS. The TpmKeySource impl is cfg-gated in src/lib.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+tss-esapi = { workspace = true }
+
+[lib]
+path = "src/lib.rs"

@@ -834,7 +834,9 @@ dependencies = [
  "log",
  "siphasher",
  "spica-common",
+ "spica-detect",
  "spica-ebpf",
+ "spica-key",
  "tokio",
  "tss-esapi",
 ]
@@ -847,6 +849,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "spica-detect"
+version = "0.1.0"
+dependencies = [
+ "spica-common",
+]
+
+[[package]]
 name = "spica-ebpf"
 version = "0.1.0"
 dependencies = [
@@ -854,6 +863,14 @@ dependencies = [
  "aya-log-ebpf",
  "spica-common",
  "which 6.0.3",
+]
+
+[[package]]
+name = "spica-key"
+version = "0.1.0"
+dependencies = [
+ "siphasher",
+ "tss-esapi",
 ]
 
 [[package]]

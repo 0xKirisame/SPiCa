@@ -5,6 +5,7 @@ members = [
     "spica-common",
     "spica-detect",
     "spica-ebpf",
+    "spica-install",
     "spica-key",
     "spica-seccheck",
     "xtask",

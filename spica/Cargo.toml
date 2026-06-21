@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 spica-common = { path = "../spica-common", features = ["user"] }
 spica-detect = { path = "../spica-detect" }
+spica-install = { path = "../spica-install" }
 spica-key = { path = "../spica-key" }
 spica-seccheck = { path = "../spica-seccheck" }
 

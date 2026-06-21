@@ -836,6 +836,7 @@ dependencies = [
  "spica-common",
  "spica-detect",
  "spica-ebpf",
+ "spica-install",
  "spica-key",
  "spica-seccheck",
  "tokio",
@@ -864,6 +865,13 @@ dependencies = [
  "aya-log-ebpf",
  "spica-common",
  "which 6.0.3",
+]
+
+[[package]]
+name = "spica-install"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ license.workspace = true
 spica-common = { path = "../spica-common", features = ["user"] }
 spica-detect = { path = "../spica-detect" }
 spica-key = { path = "../spica-key" }
+spica-seccheck = { path = "../spica-seccheck" }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }

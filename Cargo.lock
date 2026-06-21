@@ -837,6 +837,7 @@ dependencies = [
  "spica-detect",
  "spica-ebpf",
  "spica-key",
+ "spica-seccheck",
  "tokio",
  "tss-esapi",
 ]
@@ -872,6 +873,10 @@ dependencies = [
  "siphasher",
  "tss-esapi",
 ]
+
+[[package]]
+name = "spica-seccheck"
+version = "0.1.0"
 
 [[package]]
 name = "stable_deref_trait"

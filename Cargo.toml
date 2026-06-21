@@ -6,6 +6,7 @@ members = [
     "spica-detect",
     "spica-ebpf",
     "spica-key",
+    "spica-seccheck",
     "xtask",
 ]
 default-members = ["spica", "spica-common"]

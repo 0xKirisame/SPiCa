@@ -133,11 +133,16 @@ impl ProcessRecord {
     /// set to `now_nanos` so the seeded process doesn't immediately trigger
     /// GHOST (we treat it as "already observed on the sched channel" since
     /// /proc visibility is itself a form of observation).
+    ///
+    /// `now_nanos` is bumped to a minimum of 1 internally because 0 is the
+    /// "never seen" sentinel and would collide. The first tick after startup
+    /// will see `sched age = now - 1` which is essentially `now` — correct.
     pub fn seeded(now_nanos: u64) -> Self {
+        let now = if now_nanos == 0 { 1 } else { now_nanos };
         Self {
             start_time_ns: 0,
-            first_seen: now_nanos,
-            sched_last: now_nanos,
+            first_seen: now,
+            sched_last: now,
             nmi_last: 0,
             classes: [ClassState { suspect_since: 0, last_emitted: 0 }; ProcessClass::COUNT],
         }
@@ -332,19 +337,30 @@ pub fn on_nmi_event(info: ProcessInfo, registry: &mut ProcessRegistry, _now: u64
 /// Called when an LKM load attempt event arrives. Always returns a Detection
 /// (either LkmAllow during boot window or LkmDeny after gate locked). There's
 /// no "no-op" outcome — every READING_MODULE intercept emits something.
+///
+/// The comm field from the event is folded into the details string so the
+/// caller doesn't need to /proc/<tgid>/comm lookup (the calling process may
+/// have already exited — insmod returns fast).
 pub fn on_lkm_event(ev: spica_common::LkmEvent) -> Detection {
     let class = if ev.allowed == 1 { DetectionClass::LkmAllow } else { DetectionClass::LkmDeny };
+    let comm = comm_str(&ev.comm);
     let detail = if ev.allowed == 1 {
-        "module loaded (boot window, gate open)"
+        format!("module loaded (boot window, gate open) [{}]", comm)
     } else {
-        "module load blocked (gate locked)"
+        format!("module load blocked (gate locked) [{}]", comm)
     };
     Detection {
         class,
         tgid: ev.tgid,
         elapsed: 0,
-        details: format!("{}", detail),
+        details: detail,
     }
+}
+
+/// Format the kernel `comm` field (16-byte null-padded) as a UTF-8 string.
+fn comm_str(comm: &[u8; 16]) -> String {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(16);
+    String::from_utf8_lossy(&comm[..end]).into_owned()
 }
 
 #[cfg(test)]

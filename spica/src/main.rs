@@ -4,6 +4,7 @@ mod bpf;
 mod proc;
 
 use bpf::BpfRuntime;
+use clap::{Parser, Subcommand};
 use spica_common::{LkmEvent, ProcessInfo};
 use spica_detect::{Detection, DetectionClass, ProcessRecord, ProcessRegistry};
 use std::fs;
@@ -16,8 +17,40 @@ include!(concat!(env!("OUT_DIR"), "/keys.rs"));
 
 const TICK_RATE_MS: u64 = 100;
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+#[derive(Parser)]
+#[command(version, about = "SPiCa — System Process Integrity & Cross-view Analysis")]
+struct Cli {
+    /// Subcommand. If omitted, SPiCa runs detection (default behavior).
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Install SPiCa to /usr/local/bin and integrate with initramfs (requires root).
+    /// Auto-detects Debian (initramfs-tools) or Fedora (dracut).
+    Install,
+
+    /// Remove SPiCa and its initramfs integration (requires root).
+    /// Rebuilds the initramfs so the next boot doesn't reference removed hooks.
+    Uninstall,
+}
+
+fn main() -> Result<(), anyhow::Error> {
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Install)   => return spica_install::install().map_err(Into::into),
+        Some(Command::Uninstall) => return spica_install::uninstall().map_err(Into::into),
+        None => {}  // fall through to normal detection run
+    }
+    // The detection loop is async — hand off to a tokio runtime.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_detection())
+}
+
+async fn run_detection() -> Result<(), anyhow::Error> {
     // 1. Watchdog — check for leftover pin from a previously-killed instance.
     if bpf::watchdog_pin_exists() {
         println!("[WATCHDOG]   Previous SPiCa instance was not cleanly terminated — possible SIGKILL or crash");

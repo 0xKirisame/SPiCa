@@ -32,6 +32,11 @@ tokio = { version = "1.40.0", default-features = false }
 which = { version = "6.0.0", default-features = false }
 siphasher = { version = "0.3", default-features = false }
 
+# TPM 2.0 access via the TSS Enhanced System API. Wraps libtss2-esys (C).
+# Linux-only — gated by target in dependent crates. Used by spica/key.rs
+# for TpmKeySource. Keylime and other serious Rust TPM projects use this.
+tss-esapi = { version = "7.5", default-features = false }
+
 [profile.release.package.spica-ebpf]
 debug = 2
 codegen-units = 1

@@ -11,6 +11,7 @@ spica-common = { path = "../spica-common", features = ["user"] }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 aya-log = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
@@ -23,6 +24,13 @@ tokio = { workspace = true, features = [
     "signal",
     "time",
 ] }
+
+# TPM 2.0 hardware key source. Linux-only — libtss2-esys doesn't exist on macOS.
+# Code that uses tss-esapi must be gated with #[cfg(target_os = "linux")].
+# See key.rs::TpmKeySource. On non-Linux targets the compile-time fallback
+# key path is the only KeySource available.
+[target.'cfg(target_os = "linux")'.dependencies]
+tss-esapi = { workspace = true }
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

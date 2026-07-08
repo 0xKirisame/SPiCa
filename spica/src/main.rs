@@ -106,8 +106,9 @@ async fn run_detection() -> Result<(), anyhow::Error> {
     let mut sigterm = signal(SignalKind::terminate())?;
 
     loop {
+        let (sched_rb, nmi_rb, lsm_rb) = rt.split_ring_buffers();
         tokio::select! {
-            guard = rt.sched_rb_mut().readable_mut() => {
+            guard = sched_rb.readable_mut() => {
                 let mut guard = guard?;
                 let rb = guard.get_inner_mut();
                 while let Some(item) = rb.next() {
@@ -125,7 +126,7 @@ async fn run_detection() -> Result<(), anyhow::Error> {
                 }
                 guard.clear_ready();
             }
-            guard = rt.nmi_rb_mut().readable_mut() => {
+            guard = nmi_rb.readable_mut() => {
                 let mut guard = guard?;
                 let rb = guard.get_inner_mut();
                 while let Some(item) = rb.next() {
@@ -147,7 +148,7 @@ async fn run_detection() -> Result<(), anyhow::Error> {
                 }
                 guard.clear_ready();
             }
-            guard = rt.lsm_rb_mut().readable_mut() => {
+            guard = lsm_rb.readable_mut() => {
                 let mut guard = guard?;
                 let rb = guard.get_inner_mut();
                 while let Some(item) = rb.next() {

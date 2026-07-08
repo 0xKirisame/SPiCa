@@ -73,10 +73,12 @@ mod linux_tpm {
 
     impl TpmKeySource {
         pub fn new() -> Result<Self, KeyError> {
-            // TctiNamePts::Device opens the kernel resource manager path
-            // (/dev/tpmrm0). Fails cleanly if no TPM is present.
+            // TctiNameConf::Device opens the kernel resource manager path
+            // (/dev/tpm0). Fails cleanly if no TPM is present.
             let ctx = tss_esapi::Context::new(
-                tss_esapi::tcti_ldr::TctiNamePts::from_string_with_default("device"),
+                tss_esapi::tcti_ldr::TctiNameConf::Device(
+                    tss_esapi::tcti_ldr::DeviceConfig::default()
+                ),
             )
             .map_err(|_| KeyError::TpmUnavailable)?;
             Ok(Self { ctx })

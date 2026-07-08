@@ -12,6 +12,9 @@ aya-log-ebpf = { workspace = true }
 [build-dependencies]
 which = { workspace = true }
 
+[profile.release]
+panic = "abort"
+
 [[bin]]
 name = "spica"
 path = "src/main.rs"

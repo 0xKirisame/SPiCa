@@ -229,10 +229,12 @@ pub fn evaluate(
                     "NMI alive, tracepoint SILENT".to_string(),
                 ),
                 ProcessClass::Silent => (
-                    in_proc && !sched_live && !nmi_live
-                        && (record.sched_last != 0 || record.nmi_last != 0),
+                    // Only trigger for processes that sched_switch IS seeing (actively being scheduled)
+                    // but NMI never sees (despite them being "active enough" to run)
+                    // This eliminates false positives from sleeping/idle processes
+                    in_proc && sched_live && !nmi_live && record.sched_last != 0,
                     GHOST_THRESHOLD_NANOS,
-                    "total observation loss".to_string(),
+                    "scheduled but NMI-invisible".to_string(),
                 ),
                 ProcessClass::Ghost => (
                     in_proc && record.sched_last == 0 && record.nmi_last == 0,

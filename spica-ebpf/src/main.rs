@@ -162,7 +162,7 @@ fn try_sched(ctx: BtfTracePointContext) -> Result<u32, i64> {
 // level with no process PID context, so Singularity's __bpf_prog_run filter
 // ("block execution when running in hidden process context") never matches.
 
-#[perf_event(name = "spica_nmi")]
+#[perf_event]
 pub fn spica_nmi(ctx: PerfEventContext) -> u32 {
     match try_nmi(ctx) {
         Ok(ret) => ret,
@@ -208,8 +208,10 @@ fn try_nmi(_ctx: PerfEventContext) -> Result<u32, i64> {
         return Ok(0);
     }
 
-    let mut comm = [0u8; 16];
-    unsafe { bpf_get_current_comm(&mut comm as *mut [u8; 16]) };
+    let comm = match unsafe { bpf_get_current_comm() } {
+        Ok(c) => c,
+        Err(_) => [0u8; 16],
+    };
 
     let mut info = ProcessInfo {
         pid,
@@ -257,8 +259,10 @@ fn try_lsm_modblock(ctx: LsmContext) -> Result<i32, i64> {
     let pid_tgid = unsafe { bpf_get_current_pid_tgid() };
     let pid  = (pid_tgid & 0xFFFF_FFFF) as u32;
     let tgid = (pid_tgid >> 32) as u32;
-    let mut comm = [0u8; 16];
-    unsafe { bpf_get_current_comm(&mut comm as *mut [u8; 16]) };
+    let comm = match unsafe { bpf_get_current_comm() } {
+        Ok(c) => c,
+        Err(_) => [0u8; 16],
+    };
 
     let event = LkmEvent {
         pid,
@@ -283,10 +287,11 @@ fn try_lsm_modblock(ctx: LsmContext) -> Result<i32, i64> {
 // sched_process_exit because "current" IS the dying process, not a scheduling
 // artifact. sc_wd is pinned to BPF-FS by userspace; the pin outlives SIGKILL.
 
-#[tracepoint(name = "sched_process_exit")]
+#[tracepoint(name = "sched_process_exit", category = "sched")]
 pub fn spica_watchdog(ctx: TracePointContext) -> u32 {
     match try_watchdog(ctx) {
-        Ok(r) | Err(r) => r as u32,
+        Ok(r) => r,
+        Err(r) => r as u32,
     }
 }
 

@@ -9,21 +9,26 @@
 use anyhow::Result;
 use aya::{
     include_bytes_aligned,
-    maps::{Array, RingBuf},
+    maps::{MapData, RingBuf},
     programs::{BtfTracePoint, Lsm, PerfEvent, TracePoint, perf_event},
-    util, Bpf, Btf,
+    util, Ebpf, EbpfLoader, Btf,
 };
 use std::fs;
 use tokio::io::unix::AsyncFd;
+
+/// Type alias for Array<u32> maps
+type ArrayU32 = aya::maps::Array<MapData, u32>;
+/// Type alias for Array<u64> maps
+type ArrayU64 = aya::maps::Array<MapData, u64>;
 
 pub const WATCHDOG_PIN: &str = "/sys/fs/bpf/spica_watchdog";
 
 pub struct BpfRuntime {
     #[allow(dead_code)]  // owns the loaded programs; kept alive for detach-on-drop
-    bpf: Bpf,
-    sched_rb: AsyncFd<RingBuf>,
-    nmi_rb: AsyncFd<RingBuf>,
-    lsm_rb: AsyncFd<RingBuf>,
+    bpf: Ebpf,
+    sched_rb: AsyncFd<RingBuf<MapData>>,
+    nmi_rb: AsyncFd<RingBuf<MapData>>,
+    lsm_rb: AsyncFd<RingBuf<MapData>>,
     lsm_attached: bool,
 }
 
@@ -38,67 +43,111 @@ impl BpfRuntime {
         spica_pid: u32,
         integrity_token: u64,
     ) -> Result<(Self, bool)> {
-        let mut bpf = Bpf::load(include_bytes_aligned!(
+        let mut loader = EbpfLoader::new();
+
+        // Set .bss globals before loading
+        loader
+            .override_global("BASE_KEY", &base_key, false)
+            .override_global("SPICA_PID", &spica_pid, false)
+            .override_global("INTEGRITY_TOKEN", &integrity_token, false);
+
+        let mut bpf = loader.load(include_bytes_aligned!(
             concat!(env!("OUT_DIR"), "/spica")
         ))?;
 
-        // .bss globals — written before any program is loaded into the kernel.
-        // set_global modifies the backing ELF section; the kernel receives
-        // these as part of program load, not via an enumerable map update.
-        bpf.set_global("BASE_KEY", base_key, false)?;
-        bpf.set_global("SPICA_PID", spica_pid, false)?;
-        bpf.set_global("INTEGRITY_TOKEN", integrity_token, false)?;
-
         let btf = Btf::from_sys_fs()?;
 
-        // 1. sched_switch tracepoint — always available
-        let sched_prog: &mut BtfTracePoint =
-            bpf.program_mut("spica_sched").unwrap().try_into()?;
-        sched_prog.load("sched_switch", &btf)?;
-        sched_prog.attach()?;
-
-        // 2. LSM gate — kernel config dependent (CONFIG_BPF_LSM + lsm=bpf)
-        let lsm_attached = fs::read_to_string("/sys/kernel/security/lsm")
-            .map(|s| s.contains("bpf"))
-            .unwrap_or(false);
-        if lsm_attached {
-            let lsm_prog: &mut Lsm =
-                bpf.program_mut("spica_lsm_modblock").unwrap().try_into()?;
-            lsm_prog.load("kernel_read_file", &btf)?;
-            lsm_prog.attach()?;
+        // Helper function to load and attach a program in one go
+        fn load_and_attach_sched(bpf: &mut Ebpf, btf: &Btf) -> Result<()> {
+            let prog: &mut BtfTracePoint = bpf.program_mut("spica_sched").unwrap().try_into()
+                .map_err(|e| anyhow::anyhow!("failed to get sched program: {:?}", e))?;
+            prog.load("sched_switch", btf)
+                .map_err(|e| anyhow::anyhow!("failed to load sched program: {:?}", e))?;
+            prog.attach()
+                .map_err(|e| anyhow::anyhow!("failed to attach sched program: {:?}", e))?;
+            Ok(())
         }
 
-        // 3. Watchdog tracepoint — always available
-        let watchdog_prog: &mut TracePoint =
-            bpf.program_mut("spica_watchdog").unwrap().try_into()?;
-        watchdog_prog.load()?;
-        watchdog_prog.attach("sched", "sched_process_exit")?;
+        fn load_and_attach_nmi(bpf: &mut Ebpf) -> Result<()> {
+            let prog: &mut PerfEvent = bpf.program_mut("spica_nmi").unwrap().try_into()
+                .map_err(|e| anyhow::anyhow!("failed to get nmi program: {:?}", e))?;
+            prog.load()
+                .map_err(|e| anyhow::anyhow!("failed to load nmi program: {:?}", e))?;
+            let cpus = util::online_cpus().map_err(|(path, e)| {
+                anyhow::anyhow!("failed to read online CPUs from {}: {}", path, e)
+            })?;
+            for cpu in cpus {
+                prog.attach(
+                    perf_event::PerfEventConfig::Hardware(perf_event::HardwareEvent::CpuCycles),
+                    perf_event::PerfEventScope::AllProcessesOneCpu { cpu },
+                    perf_event::SamplePolicy::Period(10_000_000),
+                    false,
+                ).map_err(|e| anyhow::anyhow!("failed to attach nmi program: {:?}", e))?;
+            }
+            Ok(())
+        }
 
-        // 4. Write canary BEFORE NMI attaches to avoid spurious TAMPER on startup.
-        //    sc_canary exists as soon as Bpf::load() runs (maps are created then).
-        //    If we wrote it after nmi_prog.attach(), the NMI could fire in the
-        //    gap and see canary=0 vs INTEGRITY_TOKEN!=0 → false TAMPER.
+        fn load_watchdog(bpf: &mut Ebpf) -> Result<()> {
+            let prog: &mut TracePoint = bpf.program_mut("spica_watchdog").unwrap().try_into()
+                .map_err(|e| anyhow::anyhow!("failed to get watchdog program: {:?}", e))?;
+            prog.load()
+                .map_err(|e| anyhow::anyhow!("failed to load watchdog program: {:?}", e))?;
+            Ok(())
+        }
+
+        fn attach_watchdog(bpf: &mut Ebpf) -> Result<()> {
+            let prog: &mut TracePoint = bpf.program_mut("spica_watchdog").unwrap().try_into()
+                .map_err(|e| anyhow::anyhow!("failed to get watchdog program: {:?}", e))?;
+            prog.attach("sched", "sched_process_exit")
+                .map_err(|e| anyhow::anyhow!("failed to attach watchdog program: {:?}", e))?;
+            Ok(())
+        }
+
+        fn load_lsm_if_needed(bpf: &mut Ebpf, btf: &Btf) -> Result<bool> {
+            let lsm_attached = fs::read_to_string("/sys/kernel/security/lsm")
+                .map(|s| s.contains("bpf"))
+                .unwrap_or(false);
+            if lsm_attached {
+                let prog: &mut Lsm = bpf.program_mut("spica_lsm_modblock").unwrap().try_into()
+                    .map_err(|e| anyhow::anyhow!("failed to get lsm program: {:?}", e))?;
+                prog.load("kernel_read_file", btf)
+                    .map_err(|e| anyhow::anyhow!("failed to load lsm program: {:?}", e))?;
+            }
+            Ok(lsm_attached)
+        }
+
+        fn attach_lsm_if_attached(bpf: &mut Ebpf, attached: bool) -> Result<()> {
+            if attached {
+                let prog: &mut Lsm = bpf.program_mut("spica_lsm_modblock").unwrap().try_into()
+                    .map_err(|e| anyhow::anyhow!("failed to get lsm program: {:?}", e))?;
+                prog.attach()
+                    .map_err(|e| anyhow::anyhow!("failed to attach lsm program: {:?}", e))?;
+            }
+            Ok(())
+        }
+
+        // 1. Load all programs first
+        load_watchdog(&mut bpf)?;
+        let lsm_attached = load_lsm_if_needed(&mut bpf, &btf)?;
+
+        // 2. Write canary BEFORE NMI attaches to avoid spurious TAMPER on startup.
         {
-            let mut canary_map: Array<_, u64> =
-                bpf.map_mut("sc_canary").unwrap().try_into()?;
-            canary_map.set(0, integrity_token, 0)?;
+            let canary_map = bpf.take_map("sc_canary").unwrap();
+            let mut canary: ArrayU64 = canary_map.try_into()
+                .map_err(|e| anyhow::anyhow!("failed to convert canary map: {:?}", e))?;
+            canary.set(0, integrity_token, 0)
+                .map_err(|e| anyhow::anyhow!("failed to set canary: {:?}", e))?;
         }
 
-        // 5. NMI perf event on all online CPUs (~100-300Hz depending on CPU speed)
-        let nmi_prog: &mut PerfEvent =
-            bpf.program_mut("spica_nmi").unwrap().try_into()?;
-        nmi_prog.load()?;
-        for cpu in util::online_cpus()? {
-            nmi_prog.attach(
-                perf_event::PerfTypeId::Hardware,
-                perf_event::perf_hw_id::HW_CPU_CYCLES as u64,
-                perf_event::SamplePolicy::Period(10_000_000),
-                cpu,
-                None,
-            )?;
-        }
+        // 3. Attach observation channels in quick succession to minimize startup asymmetry
+        load_and_attach_sched(&mut bpf, &btf)?;
+        load_and_attach_nmi(&mut bpf)?;
 
-        // 6. Pin watchdog map to BPF-FS so it outlives a SIGKILL.
+        // 4. Attach remaining programs
+        attach_watchdog(&mut bpf)?;
+        attach_lsm_if_attached(&mut bpf, lsm_attached)?;
+
+        // 5. Pin watchdog map to BPF-FS so it outlives a SIGKILL.
         bpf.map("sc_wd").unwrap().pin(WATCHDOG_PIN)?;
 
         // 7. Take ring buffers into AsyncFd. take_map moves them out of `bpf`
@@ -120,16 +169,20 @@ impl BpfRuntime {
         if !self.lsm_attached {
             return Ok(());
         }
-        let mut gate: Array<_, u32> = self.bpf.map_mut("sc_gate").unwrap().try_into()?;
+        let gate_map = self.bpf.take_map("sc_gate").unwrap();
+        let mut gate: ArrayU32 = gate_map.try_into()?;
         gate.set(0, 1u32, 0)?;
         Ok(())
     }
 
     pub fn lsm_attached(&self) -> bool { self.lsm_attached }
 
-    pub fn sched_rb_mut(&mut self) -> &mut AsyncFd<RingBuf> { &mut self.sched_rb }
-    pub fn nmi_rb_mut(&mut self) -> &mut AsyncFd<RingBuf> { &mut self.nmi_rb }
-    pub fn lsm_rb_mut(&mut self) -> &mut AsyncFd<RingBuf> { &mut self.lsm_rb }
+    /// Split the runtime into its ring buffers for use in tokio::select!
+    pub fn split_ring_buffers(
+        &mut self,
+    ) -> (&mut AsyncFd<RingBuf<MapData>>, &mut AsyncFd<RingBuf<MapData>>, &mut AsyncFd<RingBuf<MapData>>) {
+        (&mut self.sched_rb, &mut self.nmi_rb, &mut self.lsm_rb)
+    }
 }
 
 // ── Watchdog pin helpers ─────────────────────────────────────────────────────

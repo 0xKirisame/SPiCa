@@ -4,9 +4,6 @@
 //! /proc tgids, current time). No file reads, no printing, no eBPF. This
 //! module is the testable surface of SPiCa's detection logic — every other
 //! module feeds it data and consumes its output.
-//!
-//! See docs/superpowers/specs/2026-06-20-spica-v4-refactor-design.md §5-6
-//! for the type-system and FSM design rationale.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,9 +18,9 @@ use spica_common::ProcessInfo;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DetectionClass {
     Dkm,        // scheduled by kernel, absent from /proc
-    Ghost,      // in /proc, never observed by eBPF
-    Tamper,     // NMI alive, sched silent (tracepoint suppression) OR canary mismatch
-    Silent,     // both channels dead (total observation loss)
+    Ghost,      // in /proc, never observed by sched_switch
+    Tamper,     // NMI detected sched_switch heartbeat frozen
+    Silent,     // channel-level observation loss (sched or NMI dead)
     Dupe,       // same TGID, different start_time_ns
     LkmAllow,   // boot-window module load
     LkmDeny,    // post-gate module load attempt
@@ -48,27 +45,23 @@ impl DetectionClass {
 
 /// Internal storage index for per-tick classes that need suspect-since +
 /// cooldown state. Distinct from DetectionClass because event-driven classes
-/// (Dupe, LkmAllow, LkmDeny, Watchdog) fire once on arrival and don't need
-/// per-record suspect/cooldown tracking.
+/// (Dupe, LkmAllow, LkmDeny, Watchdog, Tamper, Silent) fire once on arrival
+/// or are channel-level, and don't need per-record suspect/cooldown tracking.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessClass {
     Dkom = 0,
     Ghost = 1,
-    Tamper = 2,
-    Silent = 3,
 }
 
 impl ProcessClass {
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 2;
 
     /// Map to the corresponding public DetectionClass variant.
     pub fn to_detection_class(self) -> DetectionClass {
         match self {
-            ProcessClass::Dkom   => DetectionClass::Dkm,
-            ProcessClass::Ghost  => DetectionClass::Ghost,
-            ProcessClass::Tamper => DetectionClass::Tamper,
-            ProcessClass::Silent => DetectionClass::Silent,
+            ProcessClass::Dkom  => DetectionClass::Dkm,
+            ProcessClass::Ghost => DetectionClass::Ghost,
         }
     }
 
@@ -76,8 +69,6 @@ impl ProcessClass {
     pub const ALL: [ProcessClass; ProcessClass::COUNT] = [
         ProcessClass::Dkom,
         ProcessClass::Ghost,
-        ProcessClass::Tamper,
-        ProcessClass::Silent,
     ];
 }
 
@@ -96,7 +87,7 @@ pub struct ClassState {
     pub last_emitted:   u64,   // nanos since process epoch; 0 = never emitted
 }
 
-/// One record per tracked TGID. Sized to fit in two cache lines (96 bytes).
+/// One record per tracked TGID.
 ///
 /// Time fields are `u64` nanoseconds from a process-local epoch captured at
 /// SPiCa startup. Cheaper and niche-friendlier than `std::time::Instant`.
@@ -108,42 +99,44 @@ pub struct ProcessRecord {
     pub start_time_ns: u64,                          // 8  (kernel task birth time)
     pub first_seen:    u64,                          // 8  (nanos since process epoch)
     pub sched_last:    u64,                          // 8  (nanos since epoch; 0 = never)
-    pub nmi_last:      u64,                          // 8  (nanos since epoch; 0 = never)
-    pub classes:       [ClassState; ProcessClass::COUNT],  // 64 (4 × 16)
+    pub classes:       [ClassState; ProcessClass::COUNT],  // 32 (2 x 16)
 }
 
 // Lock the layout — catches accidental padding regressions during refactor.
-// Assertion lives at the type level so it's checked at every compile.
 const _: () = assert!(std::mem::size_of::<ClassState>() == 16);
-const _: () = assert!(std::mem::size_of::<ProcessRecord>() == 96);
+const _: () = assert!(std::mem::size_of::<ProcessRecord>() == 56);
 
 impl ProcessRecord {
-    /// Used when a new TGID is first observed via sched/NMI event.
+    /// Used when a new TGID is first observed via a sched event.
     pub fn new(start_time_ns: u64, now_nanos: u64) -> Self {
         Self {
             start_time_ns,
             first_seen: now_nanos,
             sched_last: 0,
-            nmi_last: 0,
             classes: [ClassState { suspect_since: 0, last_emitted: 0 }; ProcessClass::COUNT],
         }
     }
 
     /// Used when seeding the registry from /proc at startup. `sched_last` is
     /// set to `now_nanos` so the seeded process doesn't immediately trigger
-    /// GHOST (we treat it as "already observed on the sched channel" since
-    /// /proc visibility is itself a form of observation).
+    /// GHOST — we treat /proc visibility as a form of observation. Real sched
+    /// events will update `sched_last` to a fresh timestamp; if a process is
+    /// hidden from both sched AND /proc, DKOM handles it (sched_live && !in_proc).
+    ///
+    /// GHOST (in /proc but never seen by sched) is difficult to distinguish
+    /// from legitimate idle processes without additional heuristics; the
+    /// current predicate `sched_last == 0` is effectively disabled for seeded
+    /// records. A smarter GHOST (e.g. tracking `sched_observed` as a separate
+    /// flag with idle-process filtering) is a future enhancement.
     ///
     /// `now_nanos` is bumped to a minimum of 1 internally because 0 is the
-    /// "never seen" sentinel and would collide. The first tick after startup
-    /// will see `sched age = now - 1` which is essentially `now` — correct.
+    /// "never seen" sentinel and would collide.
     pub fn seeded(now_nanos: u64) -> Self {
         let now = if now_nanos == 0 { 1 } else { now_nanos };
         Self {
             start_time_ns: 0,
             first_seen: now,
             sched_last: now,
-            nmi_last: 0,
             classes: [ClassState { suspect_since: 0, last_emitted: 0 }; ProcessClass::COUNT],
         }
     }
@@ -151,6 +144,17 @@ impl ProcessRecord {
 
 /// The registry of all currently-tracked processes, keyed by TGID.
 pub type ProcessRegistry = HashMap<u32, ProcessRecord>;
+
+/// Channel-level cooldown state for SILENT alerts. Owned by the caller
+/// (main.rs) and passed mutably to evaluate() across ticks.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChannelCooldown {
+    /// Last emit time for sched-channel SILENT (0 = never emitted / recovered).
+    pub sched_silent_last: u64,
+    /// Last emit time for NMI-channel SILENT (0 = never emitted / recovered).
+    pub nmi_silent_last: u64,
+}
 
 /// One emitted detection. Returned by evaluate() and the on_*_event handlers.
 /// The caller owns formatting and side effects.
@@ -166,8 +170,6 @@ pub struct Detection {
 }
 
 // ── Time / threshold constants ───────────────────────────────────────────────
-//
-// Preserved exactly from v3.1 behavior. Adjust via this block only.
 
 pub const TICK_RATE_MS:             u64 = 100;
 pub const SUSPECT_THRESHOLD_NANOS:  u64 =     2_000_000_000;  // 2 sec
@@ -176,32 +178,89 @@ pub const ALERT_COOLDOWN_NANOS:     u64 =    30_000_000_000;  // 30 sec
 pub const GRACE_WINDOW_NANOS:       u64 =        50_000_000;  // 50 ms
 pub const STALE_NANOS:              u64 =    10_000_000_000;  // 10 sec
 pub const SCHED_LIVENESS_NANOS:     u64 =       500_000_000;  // 500 ms
-pub const NMI_LIVENESS_NANOS:       u64 =     1_000_000_000;  // 1 sec
+pub const CHANNEL_DEAD_NANOS:       u64 =     5_000_000_000;  // 5 sec — channel-level death
 
 // ── FSM implementation ───────────────────────────────────────────────────────
 
 /// Pure tick-driven evaluation. No I/O, no printing. Reads the registry +
-/// current /proc snapshot, mutates per-record suspect/cooldown state, pushes
-/// firing `Detection`s into the caller-owned `out` buffer.
+/// current /proc snapshot + channel timestamps, mutates per-record and
+/// channel-level suspect/cooldown state, pushes firing `Detection`s into the
+/// caller-owned `out` buffer.
 ///
-/// `out` is cleared at the start. Caller reuses the same `Vec` across ticks
-/// to avoid per-tick allocation (see `evaluate_does_not_allocate_when_nothing_changes`).
+/// `last_nmi_hb` is the process-local nanos timestamp of the last NMI
+/// heartbeat event received. 0 means NMI has never been heard from (early
+/// startup — channel-level SILENT will not fire until CHANNEL_DEAD_NANOS
+/// elapses, providing a natural grace period).
+///
+/// `channel_cd` tracks cooldown state for channel-level SILENT alerts.
+/// The caller owns it and reuses it across ticks.
 pub fn evaluate(
     registry: &mut ProcessRegistry,
     proc_tgids: &HashSet<u32>,
     now: u64,
+    last_nmi_hb: u64,
+    channel_cd: &mut ChannelCooldown,
     out: &mut Vec<Detection>,
 ) {
     out.clear();
 
-    // 1. Seed records for any /proc tgid we don't know yet. This is the
-    //    precondition for GHOST detection: a /proc entry that's never been
-    //    observed by an eBPF channel.
+    // 1. Seed records for any /proc tgid we don't know yet.
     for &tgid in proc_tgids {
         registry.entry(tgid).or_insert_with(|| ProcessRecord::seeded(now));
     }
 
-    // 2. Per-record evaluation.
+    // 2. Channel-level SILENT checks (before per-record loop).
+    //
+    // The scheduler is never empty on a running Linux system (init, kernel
+    // threads, timer ticks, I/O waiters). If max(sched_last) is stale beyond
+    // CHANNEL_DEAD_NANOS while /proc is non-empty, the sched channel is dead.
+    // If max_sched == 0 and we're past CHANNEL_DEAD_NANOS, sched never fired.
+
+    let max_sched = registry.values().map(|r| r.sched_last).max().unwrap_or(0);
+    let sched_stale = if max_sched == 0 { now } else { now.saturating_sub(max_sched) };
+
+    if !proc_tgids.is_empty() && sched_stale > CHANNEL_DEAD_NANOS {
+        let should_emit = channel_cd.sched_silent_last == 0
+            || now.saturating_sub(channel_cd.sched_silent_last) > ALERT_COOLDOWN_NANOS;
+        if should_emit {
+            channel_cd.sched_silent_last = now;
+            out.push(Detection {
+                class: DetectionClass::Silent,
+                tgid: 0,
+                elapsed: sched_stale,
+                details: format!(
+                    "sched_switch channel silent ({:.1}s)", sched_stale as f64 / 1e9
+                ),
+            });
+        }
+    } else {
+        channel_cd.sched_silent_last = 0;
+    }
+
+    // NMI channel death: no heartbeat event for >CHANNEL_DEAD_NANOS.
+    // last_nmi_hb == 0 means never heard from; sched_stale provides the
+    // grace period (if now < CHANNEL_DEAD_NANOS, we're still starting up).
+    let nmi_stale = if last_nmi_hb == 0 { now } else { now.saturating_sub(last_nmi_hb) };
+
+    if nmi_stale > CHANNEL_DEAD_NANOS {
+        let should_emit = channel_cd.nmi_silent_last == 0
+            || now.saturating_sub(channel_cd.nmi_silent_last) > ALERT_COOLDOWN_NANOS;
+        if should_emit {
+            channel_cd.nmi_silent_last = now;
+            out.push(Detection {
+                class: DetectionClass::Silent,
+                tgid: 0,
+                elapsed: nmi_stale,
+                details: format!(
+                    "NMI channel silent ({:.1}s)", nmi_stale as f64 / 1e9
+                ),
+            });
+        }
+    } else {
+        channel_cd.nmi_silent_last = 0;
+    }
+
+    // 3. Per-record evaluation.
     for (&tgid, record) in registry.iter_mut() {
         // Grace window: skip freshly-forked / freshly-seeded records so they
         // don't fire before the channels have had a chance to observe them.
@@ -211,35 +270,19 @@ pub fn evaluate(
 
         let in_proc    = proc_tgids.contains(&tgid);
         let sched_live = record.sched_last != 0 && now.wrapping_sub(record.sched_last) < SCHED_LIVENESS_NANOS;
-        let nmi_live   = record.nmi_last   != 0 && now.wrapping_sub(record.nmi_last)   < NMI_LIVENESS_NANOS;
 
-        // Per-class predicate + threshold. The loop body handles suspect-since
-        // tracking, threshold check, and cooldown uniformly.
         for class in ProcessClass::ALL {
             let (predicate, threshold, details) = match class {
                 ProcessClass::Dkom => (
-                    !in_proc && (sched_live || nmi_live),
+                    !in_proc && sched_live,
                     SUSPECT_THRESHOLD_NANOS,
                     format!("hidden {:.1}s", now.saturating_sub(
                         record.classes[class as usize].suspect_since) as f64 / 1e9),
                 ),
-                ProcessClass::Tamper => (
-                    in_proc && nmi_live && !sched_live && record.sched_last != 0,
-                    SUSPECT_THRESHOLD_NANOS,
-                    "NMI alive, tracepoint SILENT".to_string(),
-                ),
-                ProcessClass::Silent => (
-                    // Only trigger for processes that sched_switch IS seeing (actively being scheduled)
-                    // but NMI never sees (despite them being "active enough" to run)
-                    // This eliminates false positives from sleeping/idle processes
-                    in_proc && sched_live && !nmi_live && record.sched_last != 0,
-                    GHOST_THRESHOLD_NANOS,
-                    "scheduled but NMI-invisible".to_string(),
-                ),
                 ProcessClass::Ghost => (
-                    in_proc && record.sched_last == 0 && record.nmi_last == 0,
+                    in_proc && record.sched_last == 0,
                     GHOST_THRESHOLD_NANOS,
-                    "present in /proc, never seen by eBPF".to_string(),
+                    "present in /proc, never seen by sched".to_string(),
                 ),
             };
 
@@ -268,24 +311,23 @@ pub fn evaluate(
         }
     }
 
-    // 3. Eviction: drop records that are stale on both channels AND not in /proc.
-    //    Keeps registry bounded. Records in /proc are always retained (they're
-    //    either active processes or GHOST suspects we want to keep tracking).
+    // 4. Eviction: drop records that are stale on sched AND not in /proc.
     registry.retain(|&tgid, record| {
         let sched_age = if record.sched_last == 0 { u64::MAX } else { now.saturating_sub(record.sched_last) };
-        let nmi_age   = if record.nmi_last   == 0 { u64::MAX } else { now.saturating_sub(record.nmi_last)   };
-        sched_age < STALE_NANOS || nmi_age < STALE_NANOS || proc_tgids.contains(&tgid)
+        sched_age < STALE_NANOS || proc_tgids.contains(&tgid)
     });
 }
 
 // ── Event handlers ───────────────────────────────────────────────────────────
-//
-// Pure functions. Caller passes the decoded event + current time + registry;
-// handler returns Option<Detection> (Some for event-driven classes like DUPE).
 
 /// Called when a sched_switch event arrives. Updates `sched_last` on the
 /// record and checks for DUPE (start_time_ns mismatch — same TGID, different
 /// kernel birth timestamp). Returns Some(DUPE) if detected, else None.
+///
+/// **Time-base fix:** `sched_last` stores `now` (process-local nanos), NOT
+/// `info.last_seen` (which is bpf_ktime_get_ns() — kernel boot nanos). Mixing
+/// time bases caused all liveness predicates to silently fail in earlier
+/// versions. See README §11 (The BTF Bug Incident).
 pub fn on_sched_event(
     info: ProcessInfo,
     registry: &mut ProcessRegistry,
@@ -303,7 +345,7 @@ pub fn on_sched_event(
         && info.start_time_ns != 0
         && record.start_time_ns != info.start_time_ns
     {
-        record.sched_last = info.last_seen;
+        record.sched_last = now;
         return Some(Detection {
             class: DetectionClass::Dupe,
             tgid: info.tgid,
@@ -317,32 +359,13 @@ pub fn on_sched_event(
         record.start_time_ns = info.start_time_ns;
     }
 
-    record.sched_last = info.last_seen;
+    record.sched_last = now;
     None
-}
-
-/// Called when a normal NMI heartbeat event arrives (event_type == 0).
-/// Updates `nmi_last` on the record. Always returns None — NMI doesn't
-/// drive any event-driven detection class directly.
-///
-/// TAMPER via canary mismatch (event_type == 1) is handled by the caller
-/// (main.rs) directly — it's a raw sentinel, not FSM-driven.
-pub fn on_nmi_event(info: ProcessInfo, registry: &mut ProcessRegistry, _now: u64) {
-    if info.tgid == 0 {
-        return;
-    }
-    let record = registry.entry(info.tgid)
-        .or_insert_with(|| ProcessRecord::new(0, info.last_seen));
-    record.nmi_last = info.last_seen;
 }
 
 /// Called when an LKM load attempt event arrives. Always returns a Detection
 /// (either LkmAllow during boot window or LkmDeny after gate locked). There's
 /// no "no-op" outcome — every READING_MODULE intercept emits something.
-///
-/// The comm field from the event is folded into the details string so the
-/// caller doesn't need to /proc/<tgid>/comm lookup (the calling process may
-/// have already exited — insmod returns fast).
 pub fn on_lkm_event(ev: spica_common::LkmEvent) -> Detection {
     let class = if ev.allowed == 1 { DetectionClass::LkmAllow } else { DetectionClass::LkmDeny };
     let comm = comm_str(&ev.comm);
@@ -369,11 +392,11 @@ fn comm_str(comm: &[u8; 16]) -> String {
 mod tests {
     use super::*;
 
-    // ── Type-level sanity tests (kept from Task 6) ───────────────────────────
+    // ── Type-level sanity tests ───────────────────────────────────────────────
 
     #[test]
-    fn process_record_is_96_bytes() {
-        assert_eq!(std::mem::size_of::<ProcessRecord>(), 96);
+    fn process_record_is_56_bytes() {
+        assert_eq!(std::mem::size_of::<ProcessRecord>(), 56);
     }
 
     #[test]
@@ -387,11 +410,9 @@ mod tests {
     }
 
     #[test]
-    fn process_class_to_detection_class_covers_first_four() {
-        assert_eq!(ProcessClass::Dkom.to_detection_class(),   DetectionClass::Dkm);
-        assert_eq!(ProcessClass::Ghost.to_detection_class(),  DetectionClass::Ghost);
-        assert_eq!(ProcessClass::Tamper.to_detection_class(), DetectionClass::Tamper);
-        assert_eq!(ProcessClass::Silent.to_detection_class(), DetectionClass::Silent);
+    fn process_class_to_detection_class_covers_variants() {
+        assert_eq!(ProcessClass::Dkom.to_detection_class(),  DetectionClass::Dkm);
+        assert_eq!(ProcessClass::Ghost.to_detection_class(), DetectionClass::Ghost);
     }
 
     #[test]
@@ -407,7 +428,6 @@ mod tests {
         assert_eq!(rec.start_time_ns, 123);
         assert_eq!(rec.first_seen, 1000);
         assert_eq!(rec.sched_last, 0);
-        assert_eq!(rec.nmi_last, 0);
         for c in ProcessClass::ALL {
             assert_eq!(rec.classes[c as usize].suspect_since, 0);
             assert_eq!(rec.classes[c as usize].last_emitted, 0);
@@ -415,20 +435,20 @@ mod tests {
     }
 
     #[test]
-    fn process_record_seeded_pretends_sched_was_seen() {
+    fn process_record_seeded_marks_sched_seen() {
         let rec = ProcessRecord::seeded(5000);
         assert_eq!(rec.first_seen, 5000);
-        assert_eq!(rec.sched_last, 5000);
-        assert_eq!(rec.nmi_last, 0);
+        assert_eq!(rec.sched_last, 5000);  // seeded as observed
     }
 
-    // ── evaluate() FSM tests ─────────────────────────────────────────────────
+    #[test]
+    fn process_record_seeded_handles_zero_now() {
+        let rec = ProcessRecord::seeded(0);
+        assert_eq!(rec.first_seen, 1);  // max(1) guard
+        assert_eq!(rec.sched_last, 1);  // also max(1) guarded
+    }
 
-    // Tests that expect a fire pre-populate `suspect_since` to simulate that
-    // the predicate has been continuously true for >threshold. The FSM refuses
-    // to fire on the first tick the predicate becomes true — it waits for the
-    // threshold to elapse. This is correct behavior (avoids flapping on
-    // transient blips); tests just have to model history.
+    // ── evaluate() per-record FSM tests ──────────────────────────────────────
 
     #[test]
     fn dkom_fires_when_scheduled_but_absent_from_proc() {
@@ -436,15 +456,16 @@ mod tests {
         let tgid = 1234u32;
         let now = 5_000_000_000;
         let mut rec = ProcessRecord::new(0, 0);
-        rec.sched_last = now - 100_000_000;  // alive
+        rec.sched_last = now - 100_000_000;  // alive (100ms < 500ms liveness)
         rec.classes[ProcessClass::Dkom as usize].suspect_since =
             now - SUSPECT_THRESHOLD_NANOS - 1;
         reg.insert(tgid, rec);
 
         let proc_tgids = HashSet::new();
+        let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        evaluate(&mut reg, &proc_tgids, now, &mut out);
+        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
         assert!(out.iter().any(|d| d.class == DetectionClass::Dkm),
             "expected DKOM, got: {:?}", out);
     }
@@ -453,18 +474,18 @@ mod tests {
     fn dkom_respects_grace_window() {
         let mut reg = ProcessRegistry::new();
         let tgid = 1234u32;
-        let now = 100u64;  // very recent first_seen
+        let now = 100u64;
         let mut rec = ProcessRecord::new(0, now);
         rec.sched_last = now;
-        // Even with ancient suspect_since, grace should suppress.
         rec.classes[ProcessClass::Dkom as usize].suspect_since = 1;
         reg.insert(tgid, rec);
 
         let proc_tgids = HashSet::new();
+        let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
         let tick = now + GRACE_WINDOW_NANOS - 1;
-        evaluate(&mut reg, &proc_tgids, tick, &mut out);
+        evaluate(&mut reg, &proc_tgids, tick, 0, &mut cd, &mut out);
         assert!(out.is_empty(), "no alerts during grace window");
     }
 
@@ -480,25 +501,26 @@ mod tests {
         reg.insert(tgid, rec);
 
         let proc_tgids = HashSet::new();
+        let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        // Tick 1: fires (suspect_since pre-set past threshold)
-        evaluate(&mut reg, &proc_tgids, t1, &mut out);
+        // Tick 1: fires. Pass last_nmi_hb=t1 to keep NMI channel alive.
+        evaluate(&mut reg, &proc_tgids, t1, t1, &mut cd, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].class, DetectionClass::Dkm);
         out.clear();
 
-        // Tick 2 within cooldown — no re-fire. Keep sched alive.
+        // Tick 2 within cooldown — no re-fire. Keep sched + NMI alive.
         let t2 = t1 + 1_000_000;
         reg.get_mut(&tgid).unwrap().sched_last = t2;
-        evaluate(&mut reg, &proc_tgids, t2, &mut out);
+        evaluate(&mut reg, &proc_tgids, t2, t2, &mut cd, &mut out);
         assert!(out.is_empty(), "no re-fire within cooldown");
         out.clear();
 
         // Tick 3 past cooldown — re-fires
         let t3 = t1 + ALERT_COOLDOWN_NANOS + 1;
         reg.get_mut(&tgid).unwrap().sched_last = t3;
-        evaluate(&mut reg, &proc_tgids, t3, &mut out);
+        evaluate(&mut reg, &proc_tgids, t3, t3, &mut cd, &mut out);
         assert_eq!(out.len(), 1);
     }
 
@@ -506,7 +528,7 @@ mod tests {
     fn dkom_clears_when_process_reappears_in_proc() {
         let mut reg = ProcessRegistry::new();
         let tgid = 1234u32;
-        let mut rec = ProcessRecord::new(0, 0);  // first_seen=0
+        let mut rec = ProcessRecord::new(0, 0);
         rec.sched_last = 1;
         rec.classes[ProcessClass::Dkom as usize].suspect_since = 100;
         rec.classes[ProcessClass::Dkom as usize].last_emitted = 200;
@@ -514,13 +536,12 @@ mod tests {
 
         let mut proc_tgids = HashSet::new();
         proc_tgids.insert(tgid);
+        let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        // Tick past grace (first_seen=0, now must be > GRACE_WINDOW)
         let now = 100_000_000;
-        evaluate(&mut reg, &proc_tgids, now, &mut out);
+        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
 
-        // DKOM predicate false (now in /proc) → suspect state cleared, no fire
         assert!(out.is_empty());
         let cs = &reg.get(&tgid).unwrap().classes[ProcessClass::Dkom as usize];
         assert_eq!(cs.suspect_since, 0);
@@ -528,82 +549,174 @@ mod tests {
     }
 
     #[test]
-    fn ghost_fires_when_in_proc_never_observed() {
+    fn ghost_fires_when_in_proc_never_observed_by_sched() {
         let mut reg = ProcessRegistry::new();
         let tgid = 1234u32;
         let now = 10_000_000_000;
         let mut rec = ProcessRecord::new(0, 0);
-        rec.sched_last = 0;  // never seen
-        rec.nmi_last = 0;
+        rec.sched_last = 0;  // never seen by sched
         rec.classes[ProcessClass::Ghost as usize].suspect_since =
             now - GHOST_THRESHOLD_NANOS - 1;
         reg.insert(tgid, rec);
 
         let mut proc_tgids = HashSet::new();
         proc_tgids.insert(tgid);
+        let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        evaluate(&mut reg, &proc_tgids, now, &mut out);
+        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
         assert!(out.iter().any(|d| d.class == DetectionClass::Ghost),
             "expected GHOST, got: {:?}", out);
     }
 
+    // ── evaluate() channel-level SILENT tests ────────────────────────────────
+
     #[test]
-    fn tamper_fires_when_nmi_alive_but_sched_silent() {
+    fn silent_fires_when_sched_channel_dead() {
         let mut reg = ProcessRegistry::new();
         let tgid = 1234u32;
-        let now = 5_000_000_000;
         let mut rec = ProcessRecord::new(0, 0);
-        rec.sched_last = 1;  // was seen, but old → dead
-        rec.nmi_last = now - 100_000_000;  // alive (100ms < 1s)
-        rec.classes[ProcessClass::Tamper as usize].suspect_since =
-            now - SUSPECT_THRESHOLD_NANOS - 1;
+        rec.sched_last = 1_000_000_000;  // stale
         reg.insert(tgid, rec);
 
         let mut proc_tgids = HashSet::new();
-        proc_tgids.insert(tgid);
+        proc_tgids.insert(tgid);  // /proc non-empty
+        let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        evaluate(&mut reg, &proc_tgids, now, &mut out);
-        assert!(out.iter().any(|d| d.class == DetectionClass::Tamper),
-            "expected TAMPER, got: {:?}", out);
-    }
-
-    #[test]
-    fn silent_fires_when_both_channels_dead() {
-        let mut reg = ProcessRegistry::new();
-        let tgid = 1234u32;
-        let now = 10_000_000_000;
-        let mut rec = ProcessRecord::new(0, 0);
-        rec.sched_last = 1;  // was seen, old
-        rec.nmi_last = 1;    // was seen, old
-        rec.classes[ProcessClass::Silent as usize].suspect_since =
-            now - GHOST_THRESHOLD_NANOS - 1;
-        reg.insert(tgid, rec);
-
-        let mut proc_tgids = HashSet::new();
-        proc_tgids.insert(tgid);
-        let mut out = Vec::new();
-
-        evaluate(&mut reg, &proc_tgids, now, &mut out);
+        let now = 1_000_000_000 + CHANNEL_DEAD_NANOS + 1;  // past threshold
+        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
         assert!(out.iter().any(|d| d.class == DetectionClass::Silent),
-            "expected SILENT, got: {:?}", out);
+            "expected SILENT for dead sched channel, got: {:?}", out);
     }
 
     #[test]
-    fn evaluate_evicts_records_stale_on_both_channels_and_not_in_proc() {
+    fn silent_fires_when_nmi_channel_dead() {
+        let mut reg = ProcessRegistry::new();
+        let tgid = 1234u32;
+        let mut rec = ProcessRecord::new(0, 0);
+        rec.sched_last = 10_000_000_000;  // fresh (avoids sched-silent)
+        reg.insert(tgid, rec);
+
+        let mut proc_tgids = HashSet::new();
+        proc_tgids.insert(tgid);
+        let mut cd = ChannelCooldown::default();
+        let mut out = Vec::new();
+
+        let now = 10_000_000_000;
+        let last_nmi = 1_000_000_000u64;  // NMI heartbeat very stale
+        evaluate(&mut reg, &proc_tgids, now, last_nmi, &mut cd, &mut out);
+        assert!(out.iter().any(|d| d.class == DetectionClass::Silent
+            && d.details.contains("NMI")),
+            "expected SILENT for dead NMI channel, got: {:?}", out);
+    }
+
+    #[test]
+    fn silent_does_not_fire_during_grace_period() {
+        let mut reg = ProcessRegistry::new();
+        let tgid = 1234u32;
+        let mut rec = ProcessRecord::new(0, 0);
+        rec.sched_last = 0;  // never seen
+        reg.insert(tgid, rec);
+
+        let mut proc_tgids = HashSet::new();
+        proc_tgids.insert(tgid);
+        let mut cd = ChannelCooldown::default();
+        let mut out = Vec::new();
+
+        // now is small — within grace period
+        let now = 1_000_000_000;  // 1 sec < CHANNEL_DEAD_NANOS (5 sec)
+        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
+        assert!(out.is_empty(), "no SILENT during grace period");
+    }
+
+    #[test]
+    fn silent_respects_cooldown() {
+        let mut reg = ProcessRegistry::new();
+        let tgid = 1234u32;
+        let mut rec = ProcessRecord::new(0, 0);
+        rec.sched_last = 1_000_000_000;
+        reg.insert(tgid, rec);
+
+        let mut proc_tgids = HashSet::new();
+        proc_tgids.insert(tgid);
+        let mut cd = ChannelCooldown::default();
+        let mut out = Vec::new();
+
+        let now = 1_000_000_000 + CHANNEL_DEAD_NANOS + 1;
+
+        // Tick 1: fires
+        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
+        assert!(out.iter().any(|d| d.class == DetectionClass::Silent));
+        out.clear();
+
+        // Tick 2 within cooldown — no re-fire
+        evaluate(&mut reg, &proc_tgids, now + 1_000_000, 0, &mut cd, &mut out);
+        assert!(out.is_empty(), "no re-fire within cooldown");
+    }
+
+    #[test]
+    fn silent_clears_when_channel_recovers() {
+        let mut reg = ProcessRegistry::new();
+        let tgid = 1234u32;
+        let mut rec = ProcessRecord::new(0, 0);
+        rec.sched_last = 1_000_000_000;
+        reg.insert(tgid, rec);
+
+        let mut proc_tgids = HashSet::new();
+        proc_tgids.insert(tgid);
+        let mut cd = ChannelCooldown::default();
+        let mut out = Vec::new();
+
+        let now_dead = 1_000_000_000 + CHANNEL_DEAD_NANOS + 1;
+        evaluate(&mut reg, &proc_tgids, now_dead, 0, &mut cd, &mut out);
+        assert!(!out.is_empty());
+        assert!(cd.sched_silent_last != 0);
+        out.clear();
+
+        // Channel recovers — sched_last is fresh now
+        let now_alive = now_dead + 1_000_000;
+        reg.get_mut(&tgid).unwrap().sched_last = now_alive;
+        evaluate(&mut reg, &proc_tgids, now_alive, 0, &mut cd, &mut out);
+        assert!(out.is_empty(), "no SILENT when channel recovers");
+        assert_eq!(cd.sched_silent_last, 0, "cooldown reset on recovery");
+    }
+
+    #[test]
+    fn silent_does_not_fire_when_proc_is_empty() {
+        let mut reg = ProcessRegistry::new();
+        let tgid = 1234u32;
+        let mut rec = ProcessRecord::new(0, 0);
+        rec.sched_last = 1;  // very stale
+        reg.insert(tgid, rec);
+
+        let proc_tgids = HashSet::new();  // /proc empty — can't prove system is live
+        let mut cd = ChannelCooldown::default();
+        let mut out = Vec::new();
+
+        let now = CHANNEL_DEAD_NANOS + 10;
+        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
+        // SILENT should not fire because /proc is empty (the liveness guard)
+        assert!(out.iter().all(|d| d.class != DetectionClass::Silent
+            || !d.details.contains("sched")),
+            "sched SILENT should not fire when /proc is empty");
+    }
+
+    // ── Eviction tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn evaluate_evicts_records_stale_on_sched_and_not_in_proc() {
         let mut reg = ProcessRegistry::new();
         let tgid = 9999u32;
         let mut rec = ProcessRecord::new(0, 0);
         rec.sched_last = 1;
-        rec.nmi_last = 1;
         reg.insert(tgid, rec);
 
-        let proc_tgids = HashSet::new();  // not in /proc either
+        let proc_tgids = HashSet::new();
+        let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        // Tick past STALE_NANOS → record should be evicted
-        evaluate(&mut reg, &proc_tgids, STALE_NANOS + 1, &mut out);
+        evaluate(&mut reg, &proc_tgids, STALE_NANOS + 1, 0, &mut cd, &mut out);
         assert!(!reg.contains_key(&tgid), "stale record should be evicted");
     }
 
@@ -613,14 +726,14 @@ mod tests {
         let tgid = 9999u32;
         let mut rec = ProcessRecord::new(0, 0);
         rec.sched_last = 1;
-        rec.nmi_last = 1;
         reg.insert(tgid, rec);
 
         let mut proc_tgids = HashSet::new();
         proc_tgids.insert(tgid);
+        let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        evaluate(&mut reg, &proc_tgids, STALE_NANOS + 1, &mut out);
+        evaluate(&mut reg, &proc_tgids, STALE_NANOS + 1, 0, &mut cd, &mut out);
         assert!(reg.contains_key(&tgid), "in-proc record should be retained");
     }
 
@@ -628,23 +741,23 @@ mod tests {
     fn evaluate_does_not_reallocate_out_when_empty() {
         let mut reg = ProcessRegistry::new();
         let proc_tgids = HashSet::new();
+        let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        evaluate(&mut reg, &proc_tgids, 0, &mut out);
+        evaluate(&mut reg, &proc_tgids, 0, 0, &mut cd, &mut out);
         assert_eq!(out.len(), 0);
-        assert!(out.capacity() == 0, "no allocation when nothing fires");
 
         // Re-run — capacity should remain 0
-        evaluate(&mut reg, &proc_tgids, 1_000_000_000, &mut out);
+        evaluate(&mut reg, &proc_tgids, 1_000_000_000, 0, &mut cd, &mut out);
         assert_eq!(out.capacity(), 0, "no growth on empty re-run");
     }
 
     // ── on_sched_event / DUPE tests ──────────────────────────────────────────
 
-    fn proc_info(tgid: u32, start_time: u64, last_seen: u64) -> ProcessInfo {
+    fn proc_info(tgid: u32, start_time: u64, _last_seen: u64) -> ProcessInfo {
         ProcessInfo {
             pid: tgid, tgid, comm: [0u8; 16],
-            last_seen, start_time_ns: start_time, cpu: 0, event_type: 0,
+            last_seen: _last_seen, start_time_ns: start_time, cpu: 0, event_type: 0,
         }
     }
 
@@ -657,16 +770,14 @@ mod tests {
         assert!(result.is_none(), "first sighting should not fire DUPE");
         let rec = reg.get(&1234).unwrap();
         assert_eq!(rec.start_time_ns, 999);
-        assert_eq!(rec.sched_last, 5000);
+        assert_eq!(rec.sched_last, 5000);  // process-local time, not ktime
     }
 
     #[test]
     fn on_sched_event_fires_dupe_on_start_time_mismatch() {
         let mut reg = ProcessRegistry::new();
-        // Existing record anchored at start_time=999
         reg.insert(1234, ProcessRecord::new(999, 0));
 
-        // New event claims same TGID but different start_time
         let info = proc_info(1234, 8888, 5000);
         let result = on_sched_event(info, &mut reg, 5000);
 
@@ -679,10 +790,8 @@ mod tests {
     #[test]
     fn on_sched_event_anchors_start_time_if_unknown() {
         let mut reg = ProcessRegistry::new();
-        // Existing record with start_time=0 (was seeded from /proc)
         reg.insert(1234, ProcessRecord::new(0, 0));
 
-        // First real observation provides the start_time
         let info = proc_info(1234, 7777, 5000);
         on_sched_event(info, &mut reg, 5000);
 
@@ -700,24 +809,18 @@ mod tests {
         assert!(reg.is_empty(), "zero-TGID event should not create a record");
     }
 
-    // ── on_nmi_event tests ───────────────────────────────────────────────────
-
     #[test]
-    fn on_nmi_event_updates_nmi_last() {
+    fn on_sched_event_stores_process_local_time_not_ktime() {
+        // Regression test for the time-base bug (README §11).
+        // sched_last must store the `now` parameter (process-local nanos),
+        // NOT info.last_seen (bpf_ktime_get_ns — kernel boot nanos).
         let mut reg = ProcessRegistry::new();
-        let info = proc_info(1234, 0, 7777);
-        on_nmi_event(info, &mut reg, 7777);
+        let info = proc_info(1234, 0, 9_999_999_999_999);  // ktime-ish value
+        on_sched_event(info, &mut reg, 5_000);  // process-local time
 
         let rec = reg.get(&1234).unwrap();
-        assert_eq!(rec.nmi_last, 7777);
-    }
-
-    #[test]
-    fn on_nmi_event_ignores_zero_tgid() {
-        let mut reg = ProcessRegistry::new();
-        let info = proc_info(0, 0, 7777);
-        on_nmi_event(info, &mut reg, 7777);
-        assert!(reg.is_empty());
+        assert_eq!(rec.sched_last, 5_000, "sched_last must be process-local time");
+        assert_ne!(rec.sched_last, 9_999_999_999_999, "sched_last must NOT be ktime");
     }
 
     // ── on_lkm_event tests ───────────────────────────────────────────────────
@@ -742,4 +845,3 @@ mod tests {
         assert_eq!(d.class, DetectionClass::LkmDeny);
     }
 }
-

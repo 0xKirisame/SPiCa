@@ -28,3 +28,21 @@ pub fn read_tgids() -> HashSet<u32> {
     }
     set
 }
+
+/// Resolve a kernel PID (thread ID) to its TGID (thread group ID) via
+/// `/proc/<pid>/status`. Returns `None` if the thread has exited or the
+/// entry is unreadable.
+///
+/// The sched_switch tracepoint reports `next_pid` which is the kernel's
+/// internal PID (thread ID / LWP). For multi-threaded processes, this
+/// differs from the TGID that `/proc` lists. Without this resolution,
+/// threads would appear as DKOM (scheduled but absent from `/proc`).
+pub fn resolve_tgid(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}

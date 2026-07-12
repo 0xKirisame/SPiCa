@@ -12,12 +12,12 @@ help:
 	@echo "  Setup (one-time):"
 	@echo "    install-deps       Install system dependencies (requires root)"
 	@echo "    install-tools     Install bpf-linker and aya-tool"
-	@echo "    generate-vmlinux  Generate BTF bindings (run once per kernel update)"
+	@echo "    generate-vmlinux  Generate BTF bindings (optional — unused in current design)"
 	@echo ""
 	@echo "  Build:"
 	@echo "    build-ebpf        Compile the eBPF probe (dev/check only)"
 	@echo "    build             Compile everything: generates key, compiles eBPF + userspace"
-	@echo "    all               Full pipeline: generate-vmlinux → build"
+	@echo "    all               Full pipeline: build (vmlinux no longer required)"
 	@echo ""
 	@echo "  Run:"
 	@echo "    run               Run SPiCa (requires root)"
@@ -68,7 +68,7 @@ build-ebpf:
 build:
 	cargo build --release
 
-all: generate-vmlinux build
+all: build
 
 run:
 	sudo ./target/release/spica

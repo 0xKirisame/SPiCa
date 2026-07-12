@@ -6,7 +6,7 @@ mod proc;
 use bpf::BpfRuntime;
 use clap::{Parser, Subcommand};
 use spica_common::{LkmEvent, ProcessInfo};
-use spica_detect::{Detection, DetectionClass, ProcessRecord, ProcessRegistry};
+use spica_detect::{ChannelCooldown, Detection, DetectionClass, ProcessRecord, ProcessRegistry};
 use std::fs;
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{signal, SignalKind};
@@ -66,14 +66,9 @@ async fn run_detection() -> Result<(), anyhow::Error> {
         println!("[KEY]        TPM key loaded");
     }
 
-    // Derive the integrity canary via SipHash-1-3(BASE_KEY, "SPiCaINT").
-    // Written to both .bss INTEGRITY_TOKEN (unreachable) and sc_canary (named
-    // map, the tamper target). Divergence between them triggers [TAMPER].
-    let integrity_token = spica_key::derive_integrity_token(base_key);
-
     // 4. Load the eBPF runtime (load programs, set globals, attach, pin watchdog).
     let (mut rt, lsm_attached) =
-        BpfRuntime::load(base_key, std::process::id(), integrity_token)?;
+        BpfRuntime::load(base_key, std::process::id())?;
     if lsm_attached {
         rt.lock_lsm_gate()?;
         println!("[LSM]        Module loading locked — no new LKMs permitted");
@@ -101,6 +96,10 @@ async fn run_detection() -> Result<(), anyhow::Error> {
     // 6. Event loop. Ring buffer polling lives here (tokio::select! needs
     //    direct AsyncFd guard access); detection logic lives in spica-detect.
     let mut alerts: Vec<Detection> = Vec::new();
+    let mut channel_cd = ChannelCooldown::default();
+    let mut last_nmi_hb: u64 = 0;
+    let mut pid_tgid_cache: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut tick_count: u64 = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(TICK_RATE_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -117,6 +116,22 @@ async fn run_detection() -> Result<(), anyhow::Error> {
                     if raw.event_type == 0 {
                         let mut info = *raw;
                         spica_common::xor_fields(&mut info, base_key);
+                        // The tracepoint reports the thread ID (next_pid),
+                        // not the TGID. For multi-threaded processes, the
+                        // thread ID differs from the TGID that /proc lists.
+                        // Resolve via /proc/<pid>/status with a cache so
+                        // each unique thread ID triggers at most one read.
+                        // If /proc/<pid> doesn't exist, the process is either
+                        // hidden (DKOM candidate) or already exited — use
+                        // the PID as the TGID so DKOM detection can evaluate it.
+                        let resolved_tgid = if let Some(&t) = pid_tgid_cache.get(&info.pid) {
+                            t
+                        } else {
+                            let t = proc::resolve_tgid(info.pid).unwrap_or(info.pid);
+                            pid_tgid_cache.insert(info.pid, t);
+                            t
+                        };
+                        info.tgid = resolved_tgid;
                         if let Some(d) = spica_detect::on_sched_event(
                             info, &mut registry, nanos_since_startup(),
                         ) {
@@ -131,20 +146,16 @@ async fn run_detection() -> Result<(), anyhow::Error> {
                 let rb = guard.get_inner_mut();
                 while let Some(item) = rb.next() {
                     let raw = unsafe { &*(item.as_ptr() as *const ProcessInfo) };
+                    // event_type is read before deobfuscation (never XOR'd).
                     if raw.event_type == 1 {
-                        // Canary mismatch sentinel — rootkit intercepted the
-                        // bpf_map_update_elem call for the integrity canary.
-                        // Distinct from FSM-driven TAMPER (which fires when
-                        // NMI is alive but sched is silent); this one is the
-                        // direct map-tamper signal from the NMI program.
-                        println!("[TAMPER]     BPF map integrity check failed — sc_canary intercepted");
-                    } else {
-                        let mut info = *raw;
-                        spica_common::xor_fields(&mut info, base_key);
-                        spica_detect::on_nmi_event(
-                            info, &mut registry, nanos_since_startup(),
-                        );
+                        // sched_switch heartbeat frozen — tracepoint detached,
+                        // suppressed, or BTF/attach failure. This is the direct
+                        // integrity signal from the NMI program's .bss check.
+                        println!("[TAMPER]     sched_switch heartbeat frozen — tracepoint compromised");
                     }
+                    // Both event_type=0 (heartbeat) and event_type=1 (tamper)
+                    // prove the NMI channel is alive. Update last_nmi_hb.
+                    last_nmi_hb = nanos_since_startup();
                 }
                 guard.clear_ready();
             }
@@ -161,7 +172,16 @@ async fn run_detection() -> Result<(), anyhow::Error> {
             _ = tick.tick() => {
                 let proc_tgids = proc::read_tgids();
                 let now = nanos_since_startup();
-                spica_detect::evaluate(&mut registry, &proc_tgids, now, &mut alerts);
+                // Periodically clear the PID→TGID cache to reclaim memory
+                // from exited threads and handle PID recycling.
+                tick_count += 1;
+                if tick_count % 300 == 0 {
+                    pid_tgid_cache.clear();
+                }
+                spica_detect::evaluate(
+                    &mut registry, &proc_tgids, now, last_nmi_hb,
+                    &mut channel_cd, &mut alerts,
+                );
                 for d in &alerts {
                     print_detection(d);
                 }

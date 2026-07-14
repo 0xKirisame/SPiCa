@@ -211,6 +211,7 @@ graph TD
         FSM -->|in /proc, never seen by sched, >5s| D2["[GHOST]"]
         RB_N -->|event_type = 1| D3["[TAMPER]"]
         FSM -->|sched channel silent, /proc ≠∅| D4["[SILENT]"]
+        FSM -->|raw getdents64 ≠ libc readdir| D9["[HOOK]"]
         RB_S -->|same TGID, different start_time_ns| D5["[DUPE]"]
         RB_L -->|allowed = 1| D7["[LKM-ALLOW]"]
         RB_L -->|allowed = 0| D8["[LKM-DENY]"]
@@ -223,7 +224,7 @@ graph TD
     classDef storage  fill:#f8fafc,stroke:#64748b,stroke-width:1px;
     class RING0 kernbox;
     class RING3 userbox;
-    class D1,D2,D3,D4,D5,D6,D7,D8 alertbox;
+    class D1,D2,D3,D4,D5,D6,D7,D8,D9 alertbox;
     class RB_S,RB_N,RB_L,PROC storage;
 ```
 
@@ -234,6 +235,7 @@ graph TD
 | `[TAMPER]` | NMI detects `sched_switch` heartbeat frozen (event\_type=1) | Tracepoint detached, suppressed, or BTF/attach failure |
 | `[SILENT]` | `max(sched_last)` stale across entire registry while `/proc` is non-empty; or NMI heartbeat absent for >5 s | Channel-level observation loss — sched or NMI channel is dead |
 | `[DUPE]` | Same TGID, different `start_time_ns` across events | `task_struct` field spoofing — rootkit patches `tgid` to impersonate a legitimate process |
+| `[HOOK]` | PIDs visible via raw `getdents64` but absent from libc `readdir` | **LD_PRELOAD rootkit** — userspace library interception hiding processes from `ps`, `ls`, and other tools (Symbiote, JynxKit, Azazel, Medusa/OrBit) |
 | `[WATCHDOG]` | `/sys/fs/bpf/spica_watchdog` pin exists at startup | Previous instance was killed ungracefully (SIGKILL, OOM, crash) |
 | `[LKM-ALLOW]` | `READING_MODULE` intercepted while gate is open (boot window) | Audit record: module loaded before gate locked |
 | `[LKM-DENY]` | `READING_MODULE` intercepted while gate is locked | `insmod`/`modprobe` blocked post-init |
@@ -247,6 +249,33 @@ SILENT is a **channel-level** verdict, not a per-process one. It fires when:
 2. **NMI channel dead:** No heartbeat event (`event_type=0`) has arrived from the NMI ring buffer for >5 seconds. This means the NMI perf event stopped firing — either the perf event was detached or the PMU was reprogrammed.
 
 Both checks have a 30-second cooldown to prevent alert flooding.
+
+### LD\_PRELOAD rootkit detection (`[HOOK]`)
+
+SPiCa reads `/proc` via **two independent mechanisms** on every tick:
+
+1. **Raw `getdents64` syscall** (`read_tgids()`) — Rust's `std::fs::read_dir` calls this directly via `libc::syscall(SYS_getdents64, ...)`, bypassing all libc function hooks. LD_PRELOAD rootkits cannot intercept this path.
+
+2. **libc `readdir`** (`read_tgids_libc()`) — calls `libc::opendir` / `libc::readdir` via FFI, which goes through the dynamic linker and is fully interceptable by `/etc/ld.so.preload` hooks.
+
+If `getdents64` sees PIDs that libc `readdir` doesn't, a userspace rootkit is hooking `readdir` to hide processes. SPiCa fires `[HOOK]`:
+
+```
+[HOOK]       3 PID(s) hidden from libc readdir — LD_PRELOAD rootkit suspected
+```
+
+This technique turns SPiCa's kernel-level privilege into an active detection of userspace rootkits. The raw syscall path is the ground truth — no userspace hook can blind it. The libc path is the "perceived" view that a normal tool (ps, ls) would see. The discrepancy is unambiguous proof of library interception.
+
+**Rootkits detected by `[HOOK]`:**
+
+| Rootkit | Hiding mechanism | Detected |
+|---------|-----------------|----------|
+| Symbiote | Parasitic LD_PRELOAD, hooks `readdir` | Yes (when actively hiding) |
+| JynxKit | LD_PRELOAD, `MAGIC_GID` hiding via `readdir` | Yes |
+| Azazel | LD_PRELOAD, `readdir` + `stat` hooks | Yes |
+| Medusa/OrBit | LD_PRELOAD, `readdir` + credential theft | Yes |
+
+**Tested against real Symbiote:** A live Symbiote sample (SHA256 `f55af21f...`, MalwareBazaar) was deployed via `/etc/ld.so.preload` on an Ubuntu 24.04 VM. The sample hooks `readdir`, `readdir64`, `stat`, `fstatat`, `pam_authenticate`, `pcap_loop`, `recvmsg`, `fopen`, `read`, `execve`. When the LD_PRELOAD hook actively hides a PID from `readdir`, SPiCa fires `[HOOK]` within one tick cycle (<1 s). When Symbiote is loaded but passive (not actively hiding), SPiCa produces zero false positives.
 
 ### Grace window
 

@@ -25,6 +25,7 @@ pub enum DetectionClass {
     LkmAllow,   // boot-window module load
     LkmDeny,    // post-gate module load attempt
     Watchdog,   // prior instance killed ungracefully
+    Hook,       // LD_PRELOAD rootkit hiding processes from libc readdir
 }
 
 impl DetectionClass {
@@ -39,6 +40,7 @@ impl DetectionClass {
             DetectionClass::LkmAllow => "LKM-ALLOW",
             DetectionClass::LkmDeny  => "LKM-DENY",
             DetectionClass::Watchdog => "WATCHDOG",
+            DetectionClass::Hook     => "HOOK",
         }
     }
 }
@@ -154,6 +156,8 @@ pub struct ChannelCooldown {
     pub sched_silent_last: u64,
     /// Last emit time for NMI-channel SILENT (0 = never emitted / recovered).
     pub nmi_silent_last: u64,
+    /// Last emit time for HOOK alerts (0 = never emitted / recovered).
+    pub hook_last_emitted: u64,
 }
 
 /// One emitted detection. Returned by evaluate() and the on_*_event handlers.
@@ -197,6 +201,7 @@ pub const CHANNEL_DEAD_NANOS:       u64 =     5_000_000_000;  // 5 sec — chann
 pub fn evaluate(
     registry: &mut ProcessRegistry,
     proc_tgids: &HashSet<u32>,
+    proc_tgids_libc: &HashSet<u32>,
     now: u64,
     last_nmi_hb: u64,
     channel_cd: &mut ChannelCooldown,
@@ -209,8 +214,33 @@ pub fn evaluate(
         registry.entry(tgid).or_insert_with(|| ProcessRecord::seeded(now));
     }
 
-    // 2. Channel-level SILENT checks (before per-record loop).
+    // 2. HOOK detection — LD_PRELOAD rootkit hiding processes from libc readdir.
     //
+    // read_tgids() uses raw getdents64 (bypasses LD_PRELOAD).
+    // read_tgids_libc() uses libc readdir (goes through LD_PRELOAD hooks).
+    // If raw sees PIDs that libc doesn't, an LD_PRELOAD rootkit (Symbiote,
+    // JynxKit, Azazel, Medusa) is hiding processes from userspace tools.
+    let hidden_by_libc: Vec<u32> = proc_tgids.difference(proc_tgids_libc).copied().collect();
+    if !hidden_by_libc.is_empty() {
+        let should_emit = channel_cd.hook_last_emitted == 0
+            || now.saturating_sub(channel_cd.hook_last_emitted) > ALERT_COOLDOWN_NANOS;
+        if should_emit {
+            channel_cd.hook_last_emitted = now;
+            out.push(Detection {
+                class: DetectionClass::Hook,
+                tgid: 0,
+                elapsed: 0,
+                details: format!(
+                    "{} PID(s) hidden from libc readdir — LD_PRELOAD rootkit suspected",
+                    hidden_by_libc.len()
+                ),
+            });
+        }
+    } else {
+        channel_cd.hook_last_emitted = 0;
+    }
+
+    // 3. Channel-level SILENT checks.
     // The scheduler is never empty on a running Linux system (init, kernel
     // threads, timer ticks, I/O waiters). If max(sched_last) is stale beyond
     // CHANNEL_DEAD_NANOS while /proc is non-empty, the sched channel is dead.
@@ -465,7 +495,7 @@ mod tests {
         let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, now, 0, &mut cd, &mut out);
         assert!(out.iter().any(|d| d.class == DetectionClass::Dkm),
             "expected DKOM, got: {:?}", out);
     }
@@ -485,7 +515,7 @@ mod tests {
         let mut out = Vec::new();
 
         let tick = now + GRACE_WINDOW_NANOS - 1;
-        evaluate(&mut reg, &proc_tgids, tick, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, tick, 0, &mut cd, &mut out);
         assert!(out.is_empty(), "no alerts during grace window");
     }
 
@@ -505,7 +535,7 @@ mod tests {
         let mut out = Vec::new();
 
         // Tick 1: fires. Pass last_nmi_hb=t1 to keep NMI channel alive.
-        evaluate(&mut reg, &proc_tgids, t1, t1, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, t1, t1, &mut cd, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].class, DetectionClass::Dkm);
         out.clear();
@@ -513,14 +543,14 @@ mod tests {
         // Tick 2 within cooldown — no re-fire. Keep sched + NMI alive.
         let t2 = t1 + 1_000_000;
         reg.get_mut(&tgid).unwrap().sched_last = t2;
-        evaluate(&mut reg, &proc_tgids, t2, t2, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, t2, t2, &mut cd, &mut out);
         assert!(out.is_empty(), "no re-fire within cooldown");
         out.clear();
 
         // Tick 3 past cooldown — re-fires
         let t3 = t1 + ALERT_COOLDOWN_NANOS + 1;
         reg.get_mut(&tgid).unwrap().sched_last = t3;
-        evaluate(&mut reg, &proc_tgids, t3, t3, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, t3, t3, &mut cd, &mut out);
         assert_eq!(out.len(), 1);
     }
 
@@ -540,7 +570,7 @@ mod tests {
         let mut out = Vec::new();
 
         let now = 100_000_000;
-        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, now, 0, &mut cd, &mut out);
 
         assert!(out.is_empty());
         let cs = &reg.get(&tgid).unwrap().classes[ProcessClass::Dkom as usize];
@@ -564,7 +594,7 @@ mod tests {
         let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, now, 0, &mut cd, &mut out);
         assert!(out.iter().any(|d| d.class == DetectionClass::Ghost),
             "expected GHOST, got: {:?}", out);
     }
@@ -585,7 +615,7 @@ mod tests {
         let mut out = Vec::new();
 
         let now = 1_000_000_000 + CHANNEL_DEAD_NANOS + 1;  // past threshold
-        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, now, 0, &mut cd, &mut out);
         assert!(out.iter().any(|d| d.class == DetectionClass::Silent),
             "expected SILENT for dead sched channel, got: {:?}", out);
     }
@@ -605,7 +635,7 @@ mod tests {
 
         let now = 10_000_000_000;
         let last_nmi = 1_000_000_000u64;  // NMI heartbeat very stale
-        evaluate(&mut reg, &proc_tgids, now, last_nmi, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, now, last_nmi, &mut cd, &mut out);
         assert!(out.iter().any(|d| d.class == DetectionClass::Silent
             && d.details.contains("NMI")),
             "expected SILENT for dead NMI channel, got: {:?}", out);
@@ -626,7 +656,7 @@ mod tests {
 
         // now is small — within grace period
         let now = 1_000_000_000;  // 1 sec < CHANNEL_DEAD_NANOS (5 sec)
-        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, now, 0, &mut cd, &mut out);
         assert!(out.is_empty(), "no SILENT during grace period");
     }
 
@@ -646,12 +676,12 @@ mod tests {
         let now = 1_000_000_000 + CHANNEL_DEAD_NANOS + 1;
 
         // Tick 1: fires
-        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, now, 0, &mut cd, &mut out);
         assert!(out.iter().any(|d| d.class == DetectionClass::Silent));
         out.clear();
 
         // Tick 2 within cooldown — no re-fire
-        evaluate(&mut reg, &proc_tgids, now + 1_000_000, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, now + 1_000_000, 0, &mut cd, &mut out);
         assert!(out.is_empty(), "no re-fire within cooldown");
     }
 
@@ -669,7 +699,7 @@ mod tests {
         let mut out = Vec::new();
 
         let now_dead = 1_000_000_000 + CHANNEL_DEAD_NANOS + 1;
-        evaluate(&mut reg, &proc_tgids, now_dead, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, now_dead, 0, &mut cd, &mut out);
         assert!(!out.is_empty());
         assert!(cd.sched_silent_last != 0);
         out.clear();
@@ -677,7 +707,7 @@ mod tests {
         // Channel recovers — sched_last is fresh now
         let now_alive = now_dead + 1_000_000;
         reg.get_mut(&tgid).unwrap().sched_last = now_alive;
-        evaluate(&mut reg, &proc_tgids, now_alive, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, now_alive, 0, &mut cd, &mut out);
         assert!(out.is_empty(), "no SILENT when channel recovers");
         assert_eq!(cd.sched_silent_last, 0, "cooldown reset on recovery");
     }
@@ -695,7 +725,7 @@ mod tests {
         let mut out = Vec::new();
 
         let now = CHANNEL_DEAD_NANOS + 10;
-        evaluate(&mut reg, &proc_tgids, now, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, now, 0, &mut cd, &mut out);
         // SILENT should not fire because /proc is empty (the liveness guard)
         assert!(out.iter().all(|d| d.class != DetectionClass::Silent
             || !d.details.contains("sched")),
@@ -716,7 +746,7 @@ mod tests {
         let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        evaluate(&mut reg, &proc_tgids, STALE_NANOS + 1, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, STALE_NANOS + 1, 0, &mut cd, &mut out);
         assert!(!reg.contains_key(&tgid), "stale record should be evicted");
     }
 
@@ -733,7 +763,7 @@ mod tests {
         let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        evaluate(&mut reg, &proc_tgids, STALE_NANOS + 1, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, STALE_NANOS + 1, 0, &mut cd, &mut out);
         assert!(reg.contains_key(&tgid), "in-proc record should be retained");
     }
 
@@ -744,12 +774,80 @@ mod tests {
         let mut cd = ChannelCooldown::default();
         let mut out = Vec::new();
 
-        evaluate(&mut reg, &proc_tgids, 0, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, 0, 0, &mut cd, &mut out);
         assert_eq!(out.len(), 0);
 
         // Re-run — capacity should remain 0
-        evaluate(&mut reg, &proc_tgids, 1_000_000_000, 0, &mut cd, &mut out);
+        evaluate(&mut reg, &proc_tgids, &proc_tgids, 1_000_000_000, 0, &mut cd, &mut out);
         assert_eq!(out.capacity(), 0, "no growth on empty re-run");
+    }
+
+    // ── HOOK detection tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn hook_fires_when_libc_readdir_hides_pids() {
+        let mut reg = ProcessRegistry::new();
+        let now = 10_000_000_000u64;
+
+        let mut proc_tgids = HashSet::new();
+        proc_tgids.extend([1, 2, 3, 4, 5]);
+
+        // libc readdir sees only {1,2,3} — LD_PRELOAD rootkit hides 4,5
+        let mut proc_tgids_libc = HashSet::new();
+        proc_tgids_libc.extend([1, 2, 3]);
+
+        let mut cd = ChannelCooldown::default();
+        let mut out = Vec::new();
+
+        evaluate(&mut reg, &proc_tgids, &proc_tgids_libc, now, now, &mut cd, &mut out);
+        assert!(
+            out.iter().any(|d| d.class == DetectionClass::Hook),
+            "expected HOOK, got: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn hook_does_not_fire_when_sets_match() {
+        let mut reg = ProcessRegistry::new();
+        let now = 10_000_000_000u64;
+
+        let mut proc_tgids = HashSet::new();
+        proc_tgids.extend([1, 2, 3]);
+        let proc_tgids_libc = proc_tgids.clone();
+
+        let mut cd = ChannelCooldown::default();
+        let mut out = Vec::new();
+
+        evaluate(&mut reg, &proc_tgids, &proc_tgids_libc, now, now, &mut cd, &mut out);
+        assert!(
+            out.iter().all(|d| d.class != DetectionClass::Hook),
+            "HOOK should not fire when sets match"
+        );
+    }
+
+    #[test]
+    fn hook_respects_cooldown() {
+        let mut reg = ProcessRegistry::new();
+        let t1 = 10_000_000_000u64;
+
+        let mut proc_tgids = HashSet::new();
+        proc_tgids.extend([1, 2]);
+        let mut proc_tgids_libc = HashSet::new();
+        proc_tgids_libc.insert(1); // PID 2 hidden
+
+        let mut cd = ChannelCooldown::default();
+        let mut out = Vec::new();
+
+        // Tick 1: HOOK fires
+        evaluate(&mut reg, &proc_tgids, &proc_tgids_libc, t1, t1, &mut cd, &mut out);
+        assert!(out.iter().any(|d| d.class == DetectionClass::Hook));
+        out.clear();
+
+        // Tick 2 within cooldown — no re-fire
+        let t2 = t1 + 1_000_000;
+        evaluate(&mut reg, &proc_tgids, &proc_tgids_libc, t2, t2, &mut cd, &mut out);
+        assert!(out.is_empty(), "no re-fire within cooldown");
     }
 
     // ── on_sched_event / DUPE tests ──────────────────────────────────────────

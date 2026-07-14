@@ -171,6 +171,7 @@ async fn run_detection() -> Result<(), anyhow::Error> {
             }
             _ = tick.tick() => {
                 let proc_tgids = proc::read_tgids();
+                let proc_tgids_libc = proc::read_tgids_libc();
                 let now = nanos_since_startup();
                 // Periodically clear the PID→TGID cache to reclaim memory
                 // from exited threads and handle PID recycling.
@@ -179,7 +180,7 @@ async fn run_detection() -> Result<(), anyhow::Error> {
                     pid_tgid_cache.clear();
                 }
                 spica_detect::evaluate(
-                    &mut registry, &proc_tgids, now, last_nmi_hb,
+                    &mut registry, &proc_tgids, &proc_tgids_libc, now, last_nmi_hb,
                     &mut channel_cd, &mut alerts,
                 );
                 for d in &alerts {
@@ -205,7 +206,7 @@ fn print_detection(d: &Detection) {
     // can't be reliably read after the fact — insmod/modprobe often exit
     // before we print. Skip the comm column for those classes.
     match d.class {
-        DetectionClass::LkmAllow | DetectionClass::LkmDeny => {
+        DetectionClass::LkmAllow | DetectionClass::LkmDeny | DetectionClass::Hook => {
             println!("[{:<10}] tgid:{:<6} {}",
                 d.class.label(), d.tgid, d.details);
         }

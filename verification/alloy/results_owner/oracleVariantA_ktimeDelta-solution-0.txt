@@ -1,0 +1,38 @@
+---Trace---
+------State 0 (loop)-------
+univ={Process$0, Process$1, Addr$0, BpfMap$0, MapFD$0, MapStoreI$0, ProbeReadI$0, KtimeI$0, KtimeI$1, CondJumpI$0, DataflowEdge$0, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7}
+Int={-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7}
+seq/Int={0, 1, 2, 3, 4, 5, 6}
+String={}
+none={}
+this/Process={Process$0, Process$1}
+this/Addr={Addr$0}
+this/BpfMap={BpfMap$0}
+this/BpfMap<:kaddr={BpfMap$0->Addr$0}
+this/MapFD={MapFD$0}
+this/MapFD<:map={MapFD$0->BpfMap$0}
+this/MapFD<:holder={MapFD$0->Process$1}
+this/ProbeReadI={ProbeReadI$0}
+this/KtimeI={KtimeI$0, KtimeI$1}
+this/SpinI={}
+this/CondJumpI={CondJumpI$0}
+this/MapStoreI={MapStoreI$0}
+this/OtherI={}
+this/Instr={MapStoreI$0, ProbeReadI$0, KtimeI$0, KtimeI$1, CondJumpI$0}
+this/Instr<:pos={MapStoreI$0->4, ProbeReadI$0->-7, KtimeI$0->0, KtimeI$1->-8, CondJumpI$0->1}
+this/Probe={}
+this/Probe<:insn={}
+this/Probe<:addr={}
+this/DataflowEdge={DataflowEdge$0}
+this/DataflowEdge<:src={DataflowEdge$0->ProbeReadI$0}
+this/DataflowEdge<:dst={DataflowEdge$0->CondJumpI$0}
+this/LSMGate={}
+this/ScanDetector={}
+this/Owner={Process$1}
+this/BssMap={BpfMap$0}
+skolem $oracleVariantA_ktimeDelta_p={ProbeReadI$0}
+skolem $oracleVariantA_ktimeDelta_k1={KtimeI$1}
+skolem $oracleVariantA_ktimeDelta_k2={KtimeI$0}
+skolem $oracleVariantA_ktimeDelta_j={CondJumpI$0}
+skolem $oracleVariantA_ktimeDelta_s={MapStoreI$0}
+

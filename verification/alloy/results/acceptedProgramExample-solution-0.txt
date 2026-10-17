@@ -1,0 +1,24 @@
+---Trace---
+------State 0 (loop)-------
+univ={Addr$0, GetFdById$0, GetFdById$1, GetFdById$2, GetFdById$3, GetFdById$4, Block$0, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7}
+Int={-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7}
+seq/Int={0, 1, 2, 3, 4, 5, 6}
+String={}
+none={}
+this/Addr={Addr$0}
+this/ProbeRead={}
+this/ProbeRead<:addr={}
+this/GetNextId={}
+this/GetFdById={GetFdById$0, GetFdById$1, GetFdById$2, GetFdById$3, GetFdById$4}
+this/LookupElem={}
+this/MapOp={GetFdById$0, GetFdById$1, GetFdById$2, GetFdById$3, GetFdById$4}
+this/Other={}
+this/Instr={GetFdById$0, GetFdById$1, GetFdById$2, GetFdById$3, GetFdById$4}
+this/Block={Block$0}
+this/Block<:succs={}
+this/Block<:instrs={Block$0->GetFdById$0, Block$0->GetFdById$1, Block$0->GetFdById$2, Block$0->GetFdById$3, Block$0->GetFdById$4}
+this/LSMGate={}
+this/TimingLeak={}
+this/Target={Addr$0}
+this/Entry={Block$0}
+

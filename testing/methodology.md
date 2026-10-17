@@ -150,11 +150,12 @@ Measured with SPiCa running vs baseline:
 - **Network throughput** (`iperf3`) — should be unaffected
 - **Disk I/O** (`fio`) — should be unaffected
 
-### 3.4 NMI heartbeat statistics
+### 3.4 NMI notary statistics
 
-- **Heartbeat events/sec** (steady state, should be ~1/sec)
-- **SCHED_HEARTBEAT update rate** (should match scheduler frequency)
+- **Notary events/sec/CPU** (steady state, should be ~1/sec/CPU)
+- **Ledger append rate per CPU** (should track TGID-change rate, not context-switch rate)
 - **Ring buffer fill rate** (sched + NMI channels)
+- **Freeze verification** (all frozen maps must reject update with EPERM post-load)
 
 ---
 

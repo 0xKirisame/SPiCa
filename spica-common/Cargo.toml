@@ -11,6 +11,7 @@ user = ["aya"]
 
 [dependencies]
 aya = { workspace = true, optional = true }
+sha2 = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

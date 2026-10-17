@@ -15,3 +15,9 @@ spica-ebpf/src/generated_keys.rs
 # Claude Code session data and memory
 .claude/
 CLAUDE.md
+.DS_Store
+**/.DS_Store
+
+# Alloy model checker (verification/): tooling + specs kept local for now
+verification/alloy.jar
+verification/alloy/alloy.jar

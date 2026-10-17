@@ -42,7 +42,22 @@ if [ -d "/sys/firmware/efi/efivars" ] && ! mountpoint -q /sys/firmware/efi/efiva
     mount -t efivarfs efivarfs /sys/firmware/efi/efivars >/dev/null 2>&1
 fi
 
-# 4. Start SPiCa in the background. Logs go to an in-memory boot log.
+# 4. TPM-sealed genesis (if `spica seal-install` was run): measure the
+#    binary into PCR17, then unseal the secret under the boot-chain policy.
+#    On failure, SPiCa is NOT started — a tampered kernel/initramfs/binary
+#    must produce a loud absence, not a silently-forged anchor.
+if [ -x "/bin/spica" ] && [ -f "/etc/spica/genesis.expected" ]; then
+    mkdir -p /run
+    if /bin/spica genesis --out /run/spica.genesis \
+        --expected /etc/spica/genesis.expected >/run/spica-genesis.log 2>&1; then
+        log_success_msg "SPiCa genesis: binary measured, secret unsealed"
+    else
+        log_failure_msg "SPiCa GENESIS FAILED — tampered boot/kernel/binary; SPiCa will NOT start"
+        exit 0
+    fi
+fi
+
+# 5. Start SPiCa in the background. Logs go to an in-memory boot log.
 if [ -x "/bin/spica" ]; then
     /bin/spica >/run/spica-initramfs.log 2>&1 &
     # Brief moment for the LSM gate to attach and lock.

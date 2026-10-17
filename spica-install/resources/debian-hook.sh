@@ -22,6 +22,13 @@ esac
 # 1. Copy the SPiCa binary (eBPF probe is embedded inside it).
 if [ -f "/usr/local/bin/spica" ]; then
     copy_exec /usr/local/bin/spica /bin/spica
+
+    # Sealed-install record: needed in the initramfs for the genesis
+    # cross-check (only present after `spica seal-install`).
+    if [ -f /etc/spica/genesis.expected ]; then
+        mkdir -p "${DESTDIR}/etc/spica"
+        cp /etc/spica/genesis.expected "${DESTDIR}/etc/spica/genesis.expected"
+    fi
 else
     echo "Warning: SPiCa binary not found at /usr/local/bin/spica." >&2
     echo "         Run \`spica install\` from a built binary first." >&2

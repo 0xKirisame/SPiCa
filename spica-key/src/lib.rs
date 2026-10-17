@@ -1,15 +1,17 @@
-//! SPiCa key management — TPM-sourced obfuscation key + visible fallback.
+//! SPiCa key management — stage 3: TPM PCR anchoring.
 //!
-//! Resolves the 64-bit XOR key at startup. Tries the hardware TPM first
-//! (Linux-only, via `tss-esapi`); on any failure (no TPM, command error,
-//! non-Linux host) falls back to a per-build compile-time key with a
-//! visibly loud `INSECURE MODE` banner so operators notice.
+//! The original role of this crate (TPM-sourced XOR key) was removed with
+//! the ledger refactor — chain integrity replaced obfuscation, so there is
+//! no runtime key. Its TPM binding (`tss-esapi`) is now the home of the
+//! out-of-band finality layer: [`pcr`] extends PCR16 with a commitment to
+//! the verified ledger heads every epoch.
 //!
-//! Also owns `derive_integrity_token` — a SipHash-1-3 MAC over `BASE_KEY`
-//! used as the integrity canary. This is a *correct* MAC use case (unlike
-//! XOR obfuscation which is just read-leakage defense — see spica-common).
-//!
-//! See docs/superpowers/specs/2026-06-20-spica-v4-refactor-design.md §7-8.
+//! The old `resolve()`/`derive_integrity_token()` code below is retained
+//! only until the one-time uninstall token (also TPM-backed) lands, which
+//! will replace it.
+
+pub mod pcr;
+pub mod seal;
 
 use siphasher::sip::SipHasher13;
 use std::hash::Hasher;
@@ -75,11 +77,9 @@ mod linux_tpm {
         pub fn new() -> Result<Self, KeyError> {
             // TctiNameConf::Device opens the kernel resource manager path
             // (/dev/tpm0). Fails cleanly if no TPM is present.
-            let ctx = tss_esapi::Context::new(
-                tss_esapi::tcti_ldr::TctiNameConf::Device(
-                    tss_esapi::tcti_ldr::DeviceConfig::default()
-                ),
-            )
+            let ctx = tss_esapi::Context::new(tss_esapi::tcti_ldr::TctiNameConf::Device(
+                tss_esapi::tcti_ldr::DeviceConfig::default(),
+            ))
             .map_err(|_| KeyError::TpmUnavailable)?;
             Ok(Self { ctx })
         }
@@ -87,14 +87,16 @@ mod linux_tpm {
 
     impl KeySource for TpmKeySource {
         fn get_random_key(&mut self) -> Result<u64, KeyError> {
-            let bytes = self.ctx
+            let bytes = self
+                .ctx
                 .get_random(8)
                 .map_err(|e| KeyError::TpmCommandFailed(format!("{:?}", e)))?;
             // TSS returns a Vec<u8>; copy into fixed array.
             if bytes.len() < 8 {
-                return Err(KeyError::TpmCommandFailed(
-                    format!("GetRandom returned {} bytes, expected 8", bytes.len()),
-                ));
+                return Err(KeyError::TpmCommandFailed(format!(
+                    "GetRandom returned {} bytes, expected 8",
+                    bytes.len()
+                )));
             }
             let mut arr = [0u8; 8];
             arr.copy_from_slice(&bytes[..8]);
@@ -177,7 +179,9 @@ mod tests {
     /// Test-only key source with a fixed value.
     pub struct StaticKey(pub u64);
     impl KeySource for StaticKey {
-        fn get_random_key(&mut self) -> Result<u64, KeyError> { Ok(self.0) }
+        fn get_random_key(&mut self) -> Result<u64, KeyError> {
+            Ok(self.0)
+        }
     }
 
     // ── KeySource impls ──────────────────────────────────────────────────────
@@ -210,7 +214,11 @@ mod tests {
         let token = derive_integrity_token(key);
         assert_ne!(token, key, "token should not equal key");
         assert_ne!(token, !key, "token should not be bitwise-not of key");
-        assert_ne!(token, key.swap_bytes(), "token should not be byte-swap of key");
+        assert_ne!(
+            token,
+            key.swap_bytes(),
+            "token should not be byte-swap of key"
+        );
         assert_ne!(token, 0, "token should not be zero");
         assert_ne!(token, u64::MAX, "token should not be all-ones");
     }

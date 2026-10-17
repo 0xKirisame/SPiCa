@@ -17,13 +17,13 @@ SPiCa is an eBPF-based Linux rootkit detector written in Rust. The name comes fr
 
 1. [Threat Model](#1-threat-model)
 2. [Architecture Overview](#2-architecture-overview)
-3. [The sched\_switch Observation Channel](#3-the-sched_switch-observation-channel)
-4. [The NMI Integrity Channel](#4-the-nmi-integrity-channel)
+3. [The sched\_switch Ledger Writers](#3-the-sched_switch-ledger-writers)
+4. [The NMI Ledger Notary](#4-the-nmi-ledger-notary)
 5. [Detection Logic](#5-detection-logic)
-6. [Verifier-Bounded Address Secrecy](#6-verifier-bounded-address-secrecy)
-7. [LSM Map-Access Gate](#7-lsm-map-access-gate)
-8. [Key Management & Obfuscation](#8-key-management--obfuscation)
-9. [PCR-Bound TPM Sealing (Design)](#9-pcr-bound-tpm-sealing-design)
+6. [Integrity Model: Freeze + Chain + Notary](#6-integrity-model-freeze--chain--notary-and-why-the-old-secrecy-claim-was-wrong)
+7. [LSM Gates: Module Blocking + Deny-by-Default `bpf()`](#7-lsm-gates-module-blocking--deny-by-default-bpf)
+8. [Why There Is No Key](#8-why-there-is-no-key)
+9. [TPM PCR Anchoring (Implemented) + One-Time Uninstall Token (Design)](#9-tpm-pcr-anchoring-implemented--one-time-uninstall-token-design)
 10. [Defense in Depth](#10-defense-in-depth)
 11. [The BTF Bug Incident](#11-the-btf-bug-incident)
 12. [Known Limitations & Attack Surface](#12-known-limitations--attack-surface)
@@ -45,7 +45,7 @@ SPiCa is designed to defeat the **eBPF-constrained adversary** — an attacker w
 | Pointer safety (direct dereference requires provably valid, bounded target) | Cannot follow arbitrary pointers |
 | Restricted helpers (per-program-type allowlist) | Cannot call `kmalloc`, `vmalloc`, or any kernel allocation function |
 | No arbitrary kernel write (`bpf_probe_write_kernel` heavily restricted) | Cannot modify `task_struct`, tracepoint funcs arrays, or BPF program bytecode |
-| Map access scoped to loaded references | Cannot access maps belonging to other programs (unless enumerated by ID — see [§7](#7-lsm-map-access-gate)) |
+| Map access scoped to loaded references | Cannot access maps belonging to other programs (ID enumeration is closed by the deny-by-default `bpf()` gate — see [§7](#7-lsm-gates-module-blocking--deny-by-default-bpf)) |
 
 With LKMs blocked by the LSM gate after boot, this constrained adversary is the realistic remaining threat. SPiCa's anti-evasion machinery is calibrated for this threat — every defense is honest about what it covers and what it doesn't.
 
@@ -61,158 +61,173 @@ SPiCa is the **last-resort layer** in a defense-in-depth stack, not a substitute
 
 ## 2. Architecture Overview
 
-SPiCa runs four eBPF programs attached to kernel hooks, plus a userspace detection engine that cross-correlates their output against the system's view of itself (`/proc`).
+SPiCa runs seven eBPF programs attached to kernel hooks, plus a userspace detection engine that cross-correlates their output against the system's view of itself (`/proc`).
 
-### Three observation channels, each suppressible only by a mechanism of escalating cost
+### Observation channels, each suppressible only by a mechanism of escalating cost
 
 | Channel | Mechanism | What suppresses it | Cost of suppression |
 |---|---|---|---|
 | `/proc` | procfs directory enumeration | DKOM (unlink process from task list) | Low — well-understood rootkit technique |
-| `sched_switch` | eBPF tracepoint on the scheduler | Detach program from funcs array; filter context | Medium — requires kernel write to funcs array |
-| NMI | Hardware perf counter interrupt → eBPF perf event | Hook the IDT/NMI handler | **Near-certain kernel panic** — hardware interrupt, not maskable |
+| Ledger writers (`sched_switch`, `fork`, `exit`) | eBPF tracepoints appending to per-CPU hash chains | Detach programs; filter context | Medium — requires kernel write to funcs array, and **the chain freezes → TAMPER** |
+| NMI notary | Hardware perf counter interrupt → eBPF perf event | Hook the IDT/NMI handler | **Near-certain kernel panic** — hardware interrupt, not maskable |
 
-The key architectural property: **a rootkit cannot suppress all three channels simultaneously without the suppression itself becoming detectable or destabilizing.** Suppressing NMI requires patching the IDT (Interrupt Descriptor Table), which panics on most kernels. This is the "live bomb" — the attacker's only path to total blindness is one that likely crashes the system.
+The key architectural property: **a rootkit cannot suppress the ledger and the notary simultaneously without the suppression itself becoming detectable or destabilizing.** Suppressing NMI requires patching the IDT (Interrupt Descriptor Table), which panics on most kernels. Suppressing the ledger writers stops the chains advancing — and the NMI notary (which snapshots chain position from hardware interrupt context) is still running to notice. This is the "live bomb" — the attacker's only path to total blindness is one that likely crashes the system.
 
-### Detection model — three sentences
+### Detection model — one loop, three views, one truth table
+
+Every tick takes exactly three snapshots and classifies every TGID against a single differential anchored on the ledger — no separate check paths, no second loops:
+
+| View | What it is | What spoofs it |
+|---|---|---|
+| **L** | ledger sighting — chain-verified kernel scheduler truth (frozen, NMI-notarized) | only kernel-level suppression → TAMPER/SILENT |
+| **R** | `/proc` via raw `getdents64` | DKOM (kernel unlinks the task) |
+| **C** | `/proc` via libc `readdir` — the view every tool (ps/ls/top) gets | LD_PRELOAD hook **or** DKOM |
 
 ```
-sched sees it, /proc doesn't              → DKOM
-NMI finds sched's heartbeat stopped       → TAMPER
-sched goes globally silent, /proc != empty → SILENT
+L R C  → verdict
+1 0 0  → DKOM     — scheduler runs it, kernel won't list it (both /proc paths blind)
+x 1 0  → HOOK     — kernel lists it, libc hides it (LD_PRELOAD interception)
+0 1 x  → GHOST    — /proc lists what the scheduler has never run (fake/idle entry)
+0 0 1  → INJECT   — libc reports a process the kernel doesn't have (fabricated entry)
 ```
+
+Every deviation from the honest `111` pattern is a detection, and **the pattern itself localizes the layer** — kernel, libc, or entry-fabrication. Channel-level integrity rides above the table: chain gap/divergence/notary mismatch → TAMPER; global silence → SILENT.
 
 Each detection class is a differential verdict: a discrepancy between two or more channels. The detection engine is a pure function over the registry + /proc snapshot + channel timestamps — no I/O, no side effects, fully unit-testable.
 
-### The NMI redesign: from observation to integrity
+### The ledger redesign: from secrecy to tamper-evidence
 
-In the original design, NMI was a second process-observation channel that sampled the CPU and reported which task was running. This was redundant: sched\_switch already observes scheduling, and NMI sampled the same data via a different mechanism. The redundancy cost ~1000+ ring-buffer events/sec/CPU of process data that 99.999% of the time confirmed "yes, the scheduler is doing what the scheduler does."
+The original architecture tried to *hide* state (XOR key in `.bss`, "verifier-bounded address secrecy"). That assumption was **wrong**: `.bss` globals are backed by an ordinary `BPF_MAP_TYPE_ARRAY` map, enumerable with `BPF_MAP_GET_NEXT_ID` → `BPF_MAP_GET_FD_BY_ID` → `BPF_MAP_LOOKUP_ELEM` by any CAP_SYS_ADMIN process — the key was readable, and worse, `BPF_MAP_UPDATE_ELEM` could *spoof the heartbeat itself* from userspace, defeating the NMI integrity check without touching the kernel.
 
-In the redesigned architecture, **NMI is repurposed from process observation to tracepoint integrity verification.** It no longer reports which process is on the CPU. Instead, it verifies that `sched_switch` is actually running by reading a shared `.bss` heartbeat. This:
-
-1. Eliminates ~99% of NMI ring-buffer traffic (near-zero steady-state events)
-2. Directly detects tracepoint detachment, suppression, and BTF/attach failures (the original BTF bug — see [§11](#11-the-btf-bug-incident))
-3. Runs from a hardware interrupt, outside the tracepoint dispatch path — immune to `bpf_override_return`, kprobe interception, and funcs-array manipulation
-4. Reads `.bss` globals via direct memory access, not BPF helpers — immune to `fmod_ret` on helper functions
+The redesign inverts the game: **the ledger is public; the security property is append-only-by-construction and tamper-evidence.** Records are hash-chained in-kernel, chain state is sealed with `bpf_map_freeze` (syscall writes → EPERM for the map's lifetime; program writes unaffected), and the NMI program notarizes the chain from hardware interrupt context. Nothing needs to be secret. Every suppression or edit of evidence is *provable* — a chain gap, a divergent head, or a notary mismatch.
 
 ---
 
-## 3. The sched\_switch Observation Channel
+## 3. The sched\_switch Ledger Writers
 
-An eBPF program attached to the `sched_switch` tracepoint fires every time the kernel schedules a process onto a CPU. It reads the incoming task's PID and comm directly from the tracepoint arguments using traditional (non-BTF) fixed-offset reads:
+eBPF programs attached to `sched_switch`, `sched_process_fork`, and `sched_process_exit` tracepoints fire on process lifecycle events. They read task identity from the tracepoint arguments using traditional (non-BTF) fixed-offset reads:
 
 ```
-ctx.read_at::<u32>(56)    → next_pid
-ctx.read_at::<[u8;16]>(40) → next_comm
+sched_switch:    ctx.read_at::<u32>(56) → next_pid,  ctx.read_at::<[u8;16]>(40) → next_comm
+sched_process_fork:  child_comm @ 28, child_pid @ 44
+sched_process_exit: comm @ 8, pid @ 24
 ```
 
 **Deliberately not BTF/CO-RE.** The tracepoint argument layout is stable across kernel versions (it's part of the tracepoint ABI). Using hardcoded offsets avoids the kernel-version fragility of BTF-resolved struct navigation. This is a deliberate design choice documented in [§11](#11-the-btf-bug-incident).
 
-On every invocation, the program:
+Each writer appends a `LedgerRecord` through the shared `append_ledger` path:
 
-1. Reads `next_pid` and `next_comm` from the tracepoint context
-2. Filters out the idle task (PID 0)
-3. XOR-obfuscates the `ProcessInfo` struct with `BASE_KEY`
-4. Submits to the `sc_sched` ring buffer
-5. **Writes `bpf_ktime_get_ns()` to the `.bss` global `SCHED_HEARTBEAT`** — the heartbeat that the NMI integrity checker monitors
+1. Compute `seq = per_cpu_seq + 1` and `head = chain_hash(prev_head, seq, record)` (FNV-1a-64 over the previous head, the seq, and every content field — same function compiled into both the eBPF side and the userspace verifier, one definition of continuity).
+2. Write the record into `sc_ledger` — a frozen 65536-slot ARRAY map, the kernel-side **evidence ring** (~3.6 MB, bounded for the lifetime of the host).
+3. Mirror the record into the `sc_sched` ring buffer (transport to userspace).
+4. Only then advance the per-CPU `LEDGER_SEQ`/`LEDGER_HEAD` (a notary snapshot racing an append sees the old or the new pair — never a half-written record).
 
-The program deliberately avoids `bpf_get_current_pid_tgid()` in this context. At `sched_switch` time, "current" is the *outgoing* task, not the incoming one. The tracepoint arguments provide the correct (incoming) process identity.
+**Per-CPU chains, no locks.** Each CPU owns `LEDGER_HEAD[cpu]`/`LEDGER_SEQ[cpu]` and only its own tracepoints write them (they don't nest; the NMI program only reads). This removes every cross-CPU write race without spinlocks.
+
+**Dedupe + heartbeat.** `sched_switch` fires thousands of times per second; the dominant pattern is the same TGID rescheduling itself. A per-CPU `LAST_TGID` cache suppresses records until the scheduled TGID actually changes — ring traffic drops by orders of magnitude versus per-switch emission. Idle switches and long single-task runs emit at most one `KIND_HEARTBEAT` record per CPU per second, so a busy or idle CPU can never look like a detached probe.
+
+**LRU saturation is dead by construction.** The kernel evidence ring is a fixed recent window; the authoritative chain is the daemon's unbounded userspace copy. Evicting a slot from the kernel ring deletes nothing — the record is already committed by its successor's `prev_head`. Flood-churn (fork bombs) is itself a signal, and the notary bounds any suppression window to one second.
 
 ### Time-base discipline
 
-The detection engine uses a single monotonic time base: nanoseconds since SPiCa's process startup (`Instant::now()` since `run_detection()` entry). When a sched event arrives, the event handler stores **the caller-provided `now`** (process-local nanos), not the eBPF `bpf_ktime_get_ns()` value embedded in the event. This avoids the time-base mismatch that would occur if kernel boot time were mixed with process-local time — a bug that was present in earlier versions and caused all liveness predicates to silently fail.
+The detection engine uses a single monotonic time base: nanoseconds since SPiCa's process startup (`Instant::now()` since `run_detection()` entry). When a record arrives, the event handler stores **the caller-provided `now`** (process-local nanos), not the eBPF `bpf_ktime_get_ns()` value embedded in the record. This avoids the time-base mismatch that would occur if kernel boot time were mixed with process-local time — a bug that was present in earlier versions and caused all liveness predicates to silently fail.
 
 ---
 
-## 4. The NMI Integrity Channel
+## 4. The NMI Ledger Notary
 
-### Design: .bss heartbeat, no BTF, no kernel struct walking
+### Design: snapshot, never write
 
 The NMI program is attached to a hardware perf counter (`HW_CPU_CYCLES`) that fires at hardware interrupt level. NMIs cannot be disabled with `cli` — suppressing them requires reprogramming the PMU or hooking the IDT, both of which are loud and destabilizing.
 
-The integrity check mechanism is dead simple:
+The notary never appends to the ledger — a single writer per CPU is what makes the chains race-free. Once per second per CPU it snapshots its CPU's `(seq, head)` pair into a `NotaryEvent` on the `sc_nmi` ring buffer. Userspace cross-checks every snapshot against the chain it reconstructed from the transport ring:
 
-```
-.bss (shared within SPiCa's ELF object — all programs see the same memory):
-  SCHED_HEARTBEAT   ← written by sched_switch on every invocation
-  NMI_LAST_HB       ← NMI's record of the last heartbeat it observed
-  NMI_FIRST_TICK    ← first NMI invocation timestamp (grace period reference)
-  NMI_LAST_EMIT     ← throttle: last event emission timestamp
+| Notary observation | Meaning | Alert |
+|---|---|---|
+| `ev.seq` ahead of the userspace chain | kernel appended records that userspace never received — **records suppressed in transit** | `[TAMPER]` |
+| same `ev.seq` found in history, but `ev.head` differs | the kernel chain and the reconstructed chain disagree — **records edited in transit** | `[TAMPER]` |
+| `ev.seq` stale beyond the 256-entry history window | aged out legitimately under burst load — not a provable anomaly | ignored |
+| no seq progress on any CPU, records stopped | writer programs detached, suppressed, or never attached (BTF bug) | registry stalls → `[SILENT]` |
 
-sched_switch runs → SCHED_HEARTBEAT = bpf_ktime_get_ns()
-
-NMI fires (once per second, throttled):
-  if SCHED_HEARTBEAT == NMI_LAST_HB:
-    if past grace period (5 seconds since first NMI tick):
-      → sched_switch stopped running → emit event_type=1 (TAMPER)
-  else:
-    → sched_switch is alive → emit event_type=0 (heartbeat OK)
-  NMI_LAST_HB = SCHED_HEARTBEAT
-```
+Notary events also prove the NMI channel itself is alive: no notary for >5 s → `[SILENT]` on the NMI channel, which covers detachment of any link, including the notary's own.
 
 ### Why this detects every attack in scope
 
-| Attack | What happens | What NMI sees |
+| Attack | What happens | What userspace sees |
 |---|---|---|
-| Tracepoint detached from funcs array | sched\_switch stops executing | `SCHED_HEARTBEAT` freezes → TAMPER |
-| BTF bug / attach failure (silent) | sched\_switch never executes | `SCHED_HEARTBEAT` stays 0 → TAMPER (after grace) |
-| `bpf_override_return` on a scheduler function | If it prevents the tracepoint from firing | `SCHED_HEARTBEAT` freezes → TAMPER |
-| Bytecode patched in-place | Requires arbitrary kernel write (LKM-level) | Outside the eBPF threat model |
-| Ring buffer consumer pointer manipulated | sched events don't reach userspace | `SCHED_HEARTBEAT` still advances (the program runs) → no false TAMPER; userspace detects via `max(sched_last)` stale → SILENT |
-
-### Why `.bss` specifically
-
-`.bss` globals are stored in the BPF program's internal data section, backed by an internal array map that the loader manages. They are:
-
-- **Not separately pinnable** — they don't appear as named maps in `/sys/fs/bpf/`
-- **Not interceptable via `bpf_map_update_elem` hooks** — `.bss` writes are direct memory stores, not map-update syscalls. The old `sc_canary` mechanism (comparing a `.bss` copy against a named-map copy to detect `bpf_map_update_elem` interception) is no longer needed.
-- **Shared between programs in the same ELF object** — sched\_switch and NMI communicate through `.bss` without any external interface
+| Tracepoint detached from funcs array | writers stop, chains freeze | records stop → registry stalls → `[SILENT]`; notaries keep reporting a frozen seq |
+| BTF bug / attach failure (silent) | writers never execute | chains never start; notaries report seq 0; `[SILENT]` after grace |
+| Records suppressed in ring buffer pages (`/proc/pid/mem` edit) | userspace chain lags the kernel chain | notary ahead of chain → `[TAMPER]` |
+| Records edited in ring buffer pages | userspace recomputed head diverges | notary head mismatch at same seq → `[TAMPER]` |
+| Chain state spoofed via `BPF_MAP_UPDATE_ELEM` on `.bss` | **EPERM — the map is frozen** | nothing (attack impossible via syscall) |
+| `bpf_override_return` on a scheduler function | if it prevents writers from firing | chains freeze → `[SILENT]`/`[TAMPER]` |
+| Bytecode patched in-place | requires arbitrary kernel write (LKM-level — blocked by the module gate; raw ROP out of scope) | outside the eBPF threat model |
 
 ### Immunity to BPF-based interception
 
-The NMI integrity checker is structurally immune to BPF override attacks because of a fundamental property: `bpf_override_return` intercepts function **calls**, but the NMI checker doesn't *call* the things it verifies — it *reads `.bss` memory directly*. You cannot override the return value of a memory read because a memory read is not a function call.
-
-Additionally:
-- `bpf_probe_read_kernel` (used for kernel struct reads in alternative designs) is a fault-safe helper that accepts any address — but SPiCa's `.bss` heartbeat design doesn't even need it. The checker reads `.bss` globals via direct load instructions.
-- The NMI program runs in NMI context, where kprobes are structurally unreliable (the kernel defers or suppresses them). A kprobe-based attack against the checker's execution fights the hardware.
-
-### NMI event semantics
-
-The NMI ring buffer (`sc_nmi`) carries lightweight events:
-
-| `event_type` | Meaning | Userspace action |
-|---|---|---|
-| 0 | Heartbeat — NMI alive, sched\_switch alive | Update `last_nmi_heartbeat` timestamp |
-| 1 | TAMPER — NMI alive, sched\_switch heartbeat frozen | Print `[TAMPER]` immediately |
-
-Events are emitted at most once per second (throttled by `NMI_LAST_EMIT`). If the NMI ring buffer goes silent for >5 seconds, userspace fires `[SILENT]` — the NMI channel itself is dead.
+The notary is structurally immune to BPF override attacks because of a fundamental property: `bpf_override_return` intercepts function **calls**, but the notary doesn't *call* the thing it verifies — it *reads `.bss` memory directly* via volatile loads. You cannot override the return value of a memory read because a memory read is not a function call. Additionally, the NMI program runs in NMI context, where kprobes are structurally unreliable (the kernel defers or suppresses them). A kprobe-based attack against the checker's execution fights the hardware.
 
 ---
 
-## 5. Detection Logic
+## 5. Detection Logic — the unified three-view differential
+
+One loop, no separate check paths. Each tick the engine takes three snapshots and classifies every TGID through a single truth table anchored on the ledger:
+
+- **L — ledger sighting.** The registry's record of chain-verified scheduler observations for the TGID (fresh within `SCHED_LIVENESS_NANOS`). Written only by `on_ledger_event` after the hash chain verifies — never by /proc-derived data.
+- **R — raw `/proc`.** `getdents64` invoked directly by syscall number, bypassing every libc hook. This is the kernel's own listing, unfiltered by userspace.
+- **C — libc `/proc`.** `opendir`/`readdir` via FFI — the exact view `ps`, `ls`, `top`, and every monitoring agent on the box receives. The "most abstracted block": whichever layer wants to lie to userspace tools, this is where the lie lands.
+
+### The truth table
+
+| L | R | C | Verdict | Meaning |
+|---|---|---|---------|---------|
+| 1 | 1 | 1 | clean | all layers agree |
+| 1 | 0 | 0 | `[DKOM]` | scheduler runs it, kernel won't list it — task unlinked from /proc (both read paths agree, so the lie is *in the kernel*) |
+| x | 1 | 0 | `[HOOK]` | kernel lists it, libc hides it — LD_PRELOAD interception of `readdir` (the lie is *in libc*) |
+| 0 | 1 | x | `[GHOST]` | /proc lists what the scheduler has never run — injected/spoofed proc entry (or a legitimately idle task; see thresholds) |
+| 0 | 0 | 1 | `[INJECT]` | libc reports a process the kernel doesn't have and never scheduled — fabricated entries pushed into tools' view (the inverse of hiding: a rootkit blending in as a fake `kworker`/`systemd` line) |
+| 1 | 0 | 1 | `[DKOM]`-class anomaly | scheduled and in libc but missing from raw — raw path tampered or a DKOM race; treated as DKOM with its own details string |
+
+Every deviation from `111` is a detection, and **the pattern localizes the layer**: kernel (DKOM), libc (HOOK), entry fabrication (INJECT), proc-spoofing (GHOST). There is no seventh case: `000` means unknown/exited and is pruned by the registry's eviction policy.
+
+The old design ran this as separate pairwise checks (raw-vs-libc for HOOK; /proc-vs-sched for DKOM/GHOST). The unified table is the same three reads — but the *complete* 3-bit classification is strictly stronger: it adds `[INJECT]` (invisible to any pairwise check that doesn't anchor on the ledger), disambiguates HOOK from DKOM whenever both are in play, and collapses the detection FSM into one pass with one set of thresholds and cooldowns.
+
+### Why the ledger is the anchor
+
+R and C are both *reads of /proc* — same kernel object, two lenses. Only L comes from a different mechanism entirely: the scheduler itself, with integrity (frozen chains + NMI notary) that /proc cannot have. Anchoring the table on L means:
+
+- a kernel rootkit must defeat the **scheduler tracepoints and their hash chains** to fake L (→ TAMPER/SILENT territory), not merely /proc;
+- a userspace rootkit can only touch C (→ HOOK/INJECT), never the verdict's ground truth;
+- the table's verdicts degrade predictably: if L itself is suppressed, the channel-level checks (below) fire — there is no configuration where a hiding rootkit produces an all-clean table.
 
 ```mermaid
 graph TD
-    subgraph RING0["Kernel Space: Four eBPF Programs"]
+    subgraph RING0["Kernel Space: Seven eBPF Programs"]
         direction TB
-        SCHED_P["TracePoint, sched_switch<br/>read next_pid, next_comm<br/>write SCHED_HEARTBEAT (.bss)<br/>XOR obfuscate → sc_sched"]
-        NMI_P["PerfEvent hardware NMI<br/>read SCHED_HEARTBEAT (.bss)<br/>compare to NMI_LAST_HB<br/>frozen → event_type=1 (TAMPER)<br/>alive → event_type=0 (heartbeat)<br/>→ sc_nmi"]
-        LSM_P["BPF LSM, kernel_read_file<br/>READING_MODULE<br/>gate=0: allow + log<br/>gate=1: EPERM + log → sc_lsm"]
-        WATCH_P["TracePoint, sched_process_exit<br/>current == SPICA_PID (.bss)? → sc_wd flag"]
+        SCHED_P["TracePoint: sched_switch / fork / exit<br/>per-CPU dedupe + lifecycle<br/>append_ledger → hash chain<br/>→ sc_ledger (frozen ring) + sc_sched"]
+        NMI_P["PerfEvent hardware NMI<br/>notary: snapshot (seq, head)<br/>~1/sec/CPU → sc_nmi"]
+        LSM_P["BPF LSM: kernel_read_file<br/>READING_MODULE<br/>gate=0: allow + log<br/>gate=1: EPERM + log → sc_lsm"]
+        BPF_P["BPF LSM: bpf() syscall<br/>deny-by-default for<br/>caller_tgid != SPICA_PID"]
+        WATCH_P["TracePoint: sched_process_exit<br/>current == SPICA_PID (.bss)? → sc_wd flag"]
     end
 
-    subgraph RING3["User Space: Differential Engine"]
-        ENGINE["SPiCa (Tokio async)"] -->|XOR deobfuscate| RB_S[(sc_sched RingBuf)]
-        ENGINE -->|event_type=0: heartbeat<br/>event_type=1: TAMPER| RB_N[(sc_nmi RingBuf)]
+    subgraph RING3["User Space: One Differential Loop"]
+        ENGINE["SPiCa (Tokio async)"] -->|recompute chain_hash<br/>gap/divergence → TAMPER| RB_S[(sc_sched RingBuf)]
+        ENGINE -->|notary vs chain<br/>cross-check| RB_N[(sc_nmi RingBuf)]
         ENGINE -->|raw read| RB_L[(sc_lsm RingBuf)]
-        ENGINE -->|read_dir| PROC[" /proc"]
-        RB_S --> FSM{Detection FSM}
-        PROC --> FSM
-        FSM -->|scheduled, absent /proc, >2s| D1["[DKOM]"]
-        FSM -->|in /proc, never seen by sched, >5s| D2["[GHOST]"]
-        RB_N -->|event_type = 1| D3["[TAMPER]"]
-        FSM -->|sched channel silent, /proc ≠∅| D4["[SILENT]"]
-        FSM -->|raw getdents64 ≠ libc readdir| D9["[HOOK]"]
-        RB_S -->|same TGID, different start_time_ns| D5["[DUPE]"]
+        L["L: registry (chain-verified)"]
+        R["R: /proc via getdents64"]
+        C["C: /proc via libc readdir"]
+        L --> TABLE{truth table<br/>per TGID}
+        R --> TABLE
+        C --> TABLE
+        RB_S --> L
+        TABLE -->|100| D1["[DKOM]"]
+        TABLE -->|x10| D9["[HOOK]"]
+        TABLE -->|01x| D2["[GHOST]"]
+        TABLE -->|001| D10["[INJECT]"]
+        RB_N -->|ahead / head-mismatch / stalled| D3["[TAMPER]"]
+        TABLE -->|ledger channel silent, /proc ≠∅| D4["[SILENT]"]
         RB_L -->|allowed = 1| D7["[LKM-ALLOW]"]
         RB_L -->|allowed = 0| D8["[LKM-DENY]"]
         WATCH_P -.->|pin exists at startup| D6["[WATCHDOG]"]
@@ -224,203 +239,160 @@ graph TD
     classDef storage  fill:#f8fafc,stroke:#64748b,stroke-width:1px;
     class RING0 kernbox;
     class RING3 userbox;
-    class D1,D2,D3,D4,D5,D6,D7,D8,D9 alertbox;
-    class RB_S,RB_N,RB_L,PROC storage;
+    class D1,D2,D3,D4,D6,D7,D8,D9,D10 alertbox;
+    class RB_S,RB_N,RB_L,L,R,C storage;
 ```
 
-| Alert | Condition | What it detects |
-|-------|-----------|-----------------|
-| `[DKOM]` | Kernel-scheduled TGID absent from `/proc` for >2 s | Direct Kernel Object Manipulation — process hidden from userspace enumeration |
-| `[GHOST]` | TGID present in `/proc` but never seen by `sched_switch` for >5 s | `/proc` spoofing — fake entry inserted to pass DKOM checks |
-| `[TAMPER]` | NMI detects `sched_switch` heartbeat frozen (event\_type=1) | Tracepoint detached, suppressed, or BTF/attach failure |
-| `[SILENT]` | `max(sched_last)` stale across entire registry while `/proc` is non-empty; or NMI heartbeat absent for >5 s | Channel-level observation loss — sched or NMI channel is dead |
-| `[DUPE]` | Same TGID, different `start_time_ns` across events | `task_struct` field spoofing — rootkit patches `tgid` to impersonate a legitimate process |
-| `[HOOK]` | PIDs visible via raw `getdents64` but absent from libc `readdir` | **LD_PRELOAD rootkit** — userspace library interception hiding processes from `ps`, `ls`, and other tools (Symbiote, JynxKit, Azazel, Medusa/OrBit) |
-| `[WATCHDOG]` | `/sys/fs/bpf/spica_watchdog` pin exists at startup | Previous instance was killed ungracefully (SIGKILL, OOM, crash) |
-| `[LKM-ALLOW]` | `READING_MODULE` intercepted while gate is open (boot window) | Audit record: module loaded before gate locked |
-| `[LKM-DENY]` | `READING_MODULE` intercepted while gate is locked | `insmod`/`modprobe` blocked post-init |
+| Alert | Truth-table pattern | Threshold | What it detects |
+|-------|---------------------|-----------|-----------------|
+| `[DKOM]` | `L ∧ ¬R` (implies `¬C`) | suspect >2 s | Direct Kernel Object Manipulation — process hidden from all userspace enumeration |
+| `[HOOK]` | `R ∧ ¬C` | channel-level, 30 s cooldown | **LD_PRELOAD rootkit** hiding processes from `ps`/`ls` (Symbiote, JynxKit, Azazel, Medusa/OrBit) |
+| `[GHOST]` | `¬L ∧ R` (implies visible in /proc) | suspect >5 s | `/proc` spoofing — fake entry inserted, or scheduler-blinding |
+| `[INJECT]` | `C ∧ ¬R ∧ ¬L` | channel-level, 30 s cooldown | Fabricated process entries pushed into tools' view (rootkit blending) |
+| `[TAMPER]` | chain-level: gap / divergence / notary mismatch / PCR divergence | immediate | Records suppressed or edited in transit; evidence tampering |
+| `[SILENT]` | channel-level: `max(L)` stale while R non-empty; or no notary >5 s | 30 s cooldown | Ledger writers or NMI channel dead |
+| `[DUPE]` | *(reserved — future work: needs BTF-resolved `task_struct::start_time`)* | — | `task_struct` field spoofing |
+| `[WATCHDOG]` | `/sys/fs/bpf/spica_watchdog` pin exists at startup | immediate | Previous instance killed ungracefully |
+| `[LKM-ALLOW]`/`[LKM-DENY]` | `READING_MODULE` audit events | immediate | Boot-window module loads / post-gate attempts |
 
 ### Channel-level SILENT detection
 
 SILENT is a **channel-level** verdict, not a per-process one. It fires when:
 
-1. **sched channel dead:** `max(sched_last)` over all registry records is stale beyond `CHANNEL_DEAD_NANOS` while `/proc` is non-empty. The non-empty-/proc guard is the liveness guarantee: on any running Linux system, `/proc` is non-empty (init, kernel threads, kworkers), and the scheduler is never truly idle (timer ticks, I/O waiters, RCU callbacks). A stale `max(sched_last)` on a non-empty system means the channel died — not that the system is idle.
+1. **Ledger channel dead:** `max(L)` over all registry records is stale beyond `CHANNEL_DEAD_NANOS` while raw `/proc` is non-empty. The non-empty-/proc guard is the liveness guarantee: on any running Linux system, `/proc` is non-empty (init, kernel threads, kworkers), and the scheduler is never truly idle (timer ticks, I/O waiters, RCU callbacks) — a stale `max(L)` on a non-empty system means the channel died, not that the system is idle.
 
-2. **NMI channel dead:** No heartbeat event (`event_type=0`) has arrived from the NMI ring buffer for >5 seconds. This means the NMI perf event stopped firing — either the perf event was detached or the PMU was reprogrammed.
+2. **NMI channel dead:** No notary event has arrived from the NMI ring buffer for >5 seconds — the perf event was detached or the PMU reprogrammed.
 
-Both checks have a 30-second cooldown to prevent alert flooding.
+### The C lens (libc readdir) — where userspace rootkits live
 
-### LD\_PRELOAD rootkit detection (`[HOOK]`)
+The R/C split is what makes `[HOOK]` and `[INJECT]` work: both lenses read the same kernel object, but C passes through the dynamic linker and every `/etc/ld.so.preload` hook — exactly the path every tool on the box depends on. R, invoked by raw syscall number, is invisible to those hooks. Their difference is therefore unambiguous proof of library interception, with direction: missing entries = hiding (`[HOOK]`), extra entries = fabrication (`[INJECT]`).
 
-SPiCa reads `/proc` via **two independent mechanisms** on every tick:
+**Rootkits detected through the C lens:**
 
-1. **Raw `getdents64` syscall** (`read_tgids()`) — Rust's `std::fs::read_dir` calls this directly via `libc::syscall(SYS_getdents64, ...)`, bypassing all libc function hooks. LD_PRELOAD rootkits cannot intercept this path.
+| Rootkit | Mechanism | Pattern |
+|---------|-----------|---------|
+| Symbiote | parasitic LD_PRELOAD, hooks `readdir` | `x10` → `[HOOK]` |
+| JynxKit | LD_PRELOAD, `MAGIC_GID` hiding | `x10` → `[HOOK]` |
+| Azazel | LD_PRELOAD, `readdir` + `stat` hooks | `x10` → `[HOOK]` |
+| Medusa/OrBit | LD_PRELOAD, `readdir` + credential theft | `x10` → `[HOOK]` |
+| *(any)* injecting fake `kworker` entries | fabricated `readdir` output | `001` → `[INJECT]` |
 
-2. **libc `readdir`** (`read_tgids_libc()`) — calls `libc::opendir` / `libc::readdir` via FFI, which goes through the dynamic linker and is fully interceptable by `/etc/ld.so.preload` hooks.
+**Tested against real Symbiote:** A live Symbiote sample (SHA256 `f55af21f...`, MalwareBazaar) was deployed via `/etc/ld.so.preload` on an Ubuntu 24.04 VM. With the hook actively hiding a PID, SPiCa fires `[HOOK]` within one tick (<1 s); loaded-but-passive produces zero false positives.
 
-If `getdents64` sees PIDs that libc `readdir` doesn't, a userspace rootkit is hooking `readdir` to hide processes. SPiCa fires `[HOOK]`:
+### Grace windows and thresholds
 
-```
-[HOOK]       3 PID(s) hidden from libc readdir — LD_PRELOAD rootkit suspected
-```
-
-This technique turns SPiCa's kernel-level privilege into an active detection of userspace rootkits. The raw syscall path is the ground truth — no userspace hook can blind it. The libc path is the "perceived" view that a normal tool (ps, ls) would see. The discrepancy is unambiguous proof of library interception.
-
-**Rootkits detected by `[HOOK]`:**
-
-| Rootkit | Hiding mechanism | Detected |
-|---------|-----------------|----------|
-| Symbiote | Parasitic LD_PRELOAD, hooks `readdir` | Yes (when actively hiding) |
-| JynxKit | LD_PRELOAD, `MAGIC_GID` hiding via `readdir` | Yes |
-| Azazel | LD_PRELOAD, `readdir` + `stat` hooks | Yes |
-| Medusa/OrBit | LD_PRELOAD, `readdir` + credential theft | Yes |
-
-**Tested against real Symbiote:** A live Symbiote sample (SHA256 `f55af21f...`, MalwareBazaar) was deployed via `/etc/ld.so.preload` on an Ubuntu 24.04 VM. The sample hooks `readdir`, `readdir64`, `stat`, `fstatat`, `pam_authenticate`, `pcap_loop`, `recvmsg`, `fopen`, `read`, `execve`. When the LD_PRELOAD hook actively hides a PID from `readdir`, SPiCa fires `[HOOK]` within one tick cycle (<1 s). When Symbiote is loaded but passive (not actively hiding), SPiCa produces zero false positives.
-
-### Grace window
-
-A 50 ms grace window prevents false positives on freshly-forked processes. Channel-level SILENT checks have a 5-second grace period (the NMI program's `NMI_FIRST_TICK` reference) so that startup latency doesn't produce false TAMPER alerts.
+- 50 ms per-record grace: freshly-forked TGIDs don't fire before the channels can observe them.
+- Startup seeding: processes pre-existing at daemon start are marked observed-with-unknown-L until their first ledger sighting, so GHOST doesn't fire on a busy system's long sleepers; genuine GHOST still matures past the 5 s threshold.
+- Channel-level checks carry a 5 s startup grace (the notary's `NMI_FIRST_TICK` reference) and 30 s alert cooldowns.
 
 ---
 
-## 6. Verifier-Bounded Address Secrecy
+## 6. Integrity Model: Freeze + Chain + Notary (and why the old secrecy claim was wrong)
 
-### Definition
+### The retired assumption
 
-**Verifier-bounded address secrecy** is a computational security property that holds under the eBPF-constrained adversary model. It states:
+Earlier versions claimed **"verifier-bounded address secrecy"**: that the kernel address of `.bss` backing state was computationally infeasible for an eBPF adversary to discover, protecting a 64-bit XOR obfuscation key. Studying the actual kernel source (`kernel/bpf/syscall.c`, v6.8) showed this was never true:
 
-> Given an adversary who can load eBPF programs (CAP\_BPF) but is constrained by the BPF verifier (bounded loops, restricted helpers, no arbitrary kernel write), the kernel address of a BPF program's `.bss` data section is computationally infeasible to discover.
+> `.bss`/`.data`/`.rodata` globals are implemented as ordinary anonymous `BPF_MAP_TYPE_ARRAY` maps (created by the loader, `BPF_F_MMAPABLE`). Any CAP\_BPF/CAP\_SYS\_ADMIN process can `BPF_MAP_GET_NEXT_ID` → `BPF_MAP_GET_FD_BY_ID` → `BPF_MAP_LOOKUP_ELEM` and read every global — including `BASE_KEY`. Worse, `BPF_MAP_UPDATE_ELEM` on the unfrozen `.bss` map could **spoof `SCHED_HEARTBEAT` from userspace**, silently defeating the NMI integrity checker. The key disclosure and the heartbeat spoof are the same single bug: the state lived on an enumerable, writable syscall interface.
 
-### The four mechanisms
+The corrected claim is the opposite: **secrecy is not the mechanism — verifiability is.** The ledger is public-readable by design; what matters is that nobody but SPiCa's own programs can *append*, and that any *edit or suppression of evidence is provable*.
 
-The property is a composition of four independent barriers:
+### The three mechanisms
 
-1. **kASLR** — Kernel Address Space Layout Randomization randomizes the kernel heap region where BPF map memory (including `.bss` backing maps) is allocated. The exact address changes on every boot.
+1. **`bpf_map_freeze` (seal the state).** Right after load and gate-close, the daemon freezes `.bss` (chain heads, seqs, `SPICA_PID`), `sc_gate`, `sc_wd`, and `sc_ledger`. Exact v6.8 semantics, verified from source:
 
-2. **Verifier instruction bound** — The BPF verifier bounds total instructions per program to ~1 million and requires provably terminating loops. An adversary's scanning program can probe at most N ≈ 10^6 addresses per load via `bpf_probe_read_kernel`. Given a kASLR-randomized search space, per-program success probability is negligible.
+   - Frozen maps reject every syscall update/delete with `-EPERM` (`map_get_sys_perms` strips `FMODE_CAN_WRITE`) — the heartbeat-spoof path is dead.
+   - **Program writes are unaffected** — freeze only gates the syscall path, which is precisely why the writers keep advancing frozen state.
+   - Freeze is **irreversible for the map's lifetime**; there is no `BPF_MAP_UNFREEZE`.
+   - Failure modes the daemon handles explicitly: `-EBUSY` if a writable mmap is outstanding (aya writes initial globals via `update_elem`, not a persistent mapping, so this cannot happen at runtime — but note that **libbpf skeletons cannot freeze their own `.bss`** for exactly this reason; empirically confirmed in `testing/freeze/RESULTS.md`) or if already frozen; `-ENOTSUPP` for maps with BTF records (kptr fields — unfreezable by design); and the **freeze-griefing race**: any privileged process holding a writable fd can freeze a map during the load window (no owner check in `map_freeze` — empirically confirmed, T7). SPiCa defuses this by *design*: every freezable map it creates is one it wants frozen immediately anyway, and the gate map is written-then-frozen in one breath — an attacker freezing it early does nothing but accelerate the seal. If the daemon's own gate-close write returns EPERM (someone froze the gate open), load **aborts fail-closed**.
+   - Freezes are **verified** by re-freezing and requiring failure — on v6.8 the observable is `-EPERM` (freezing strips the fd's write mode, so the second attempt fails the permissions check before the already-frozen `-EBUSY` path; empirically confirmed in `testing/freeze/`). A second freeze that *succeeds* means the map is not sealed — abort rather than run on spoofable state.
 
-3. **LSM map-access gate** (see [§7](#7-lsm-map-access-gate)) — Without the gate, an adversary could enumerate BPF maps by ID (`BPF_MAP_GET_NEXT_ID` → `BPF_MAP_GET_FD_BY_ID` → `BPF_MAP_LOOKUP_ELEM`) and read `.bss` contents directly. The gate removes this easy path, forcing the adversary into the verifier-bounded memory-scan path.
+2. **Per-CPU hash chains (make the evidence self-verifying).** Every record commits to its predecessor: `head = chain_hash(prev_head, seq, fields)` — FNV-1a-64, compiled into both sides from one crate, no drift possible. Userspace recomputes every link. A gap → suppression; a divergent `prev_head` → editing. Chains are per-CPU so there is exactly one writer per chain and no locks are needed. The kernel-side `sc_ledger` ring (65536 slots, frozen) is the recent evidence window; the daemon's unbounded copy is the authoritative chain. LRU-saturation attacks fail by construction: eviction from the window deletes nothing that the chain hasn't already committed.
 
-4. **`.bss` placement** — `.bss` globals do not appear in named-map enumeration interfaces with human-readable names. The internal `.bss` backing map is named `.bss` by libbpf/aya, but its contents (the actual global variables) are only accessible if you have the map fd. The map fd requires either the loading process's fd table or the map ID (blocked by the gate).
+3. **The NMI notary (cross-check from hardware context).** Independent snapshots of each CPU's chain position, taken from NMI context that kprobes can't reliably hook and `bpf_override_return` can't intercept (it reads memory, not calls). If the transport is tampered with, the notary's version of the chain disagrees with the userspace reconstruction → `[TAMPER]` within one second.
 
-### Formal argument structure
+### Honest boundaries
 
-```
-Adversary's goal:    locate SPiCa's .bss in kernel virtual memory
-Search space:        kernel heap region, kASLR-randomized (~2^30 entropy)
-
-Path A — map enumeration (blocked):
-  BPF_MAP_GET_NEXT_ID → BPF_MAP_GET_FD_BY_ID → BPF_MAP_LOOKUP_ELEM
-  → blocked by LSM gate (§7) for non-SPiCa processes
-
-Path B — memory scan (bounded):
-  bpf_probe_read_kernel(addr, buf, len) — fault-safe, accepts any addr
-  Per-program capacity: N ≈ 10^6 probes (instruction limit)
-  Success probability per load: N / |search space| ≈ 10^6 / 2^30 ≈ 10^-24
-  Can reload programs, but: each load is a syscall (observable), and
-  the target address doesn't change between loads (same boot session)
-
-Path C — timing side channel (theoretical):
-  bpf_probe_read_kernel timing varies on fault vs success
-  Binary search over the heap could reduce scan complexity to O(log |A|)
-  → O(30) probes, well within instruction budget
-  LIMITATION: must be acknowledged. Mitigated by rate-limiting BPF_PROG_LOAD
-  via the LSM gate (future work).
-```
-
-### What makes this novel
-
-Most BPF security research treats the verifier as an **attack surface** (verifier bugs, unsoundness, JIT spray). This work inverts the framing: the verifier's constraints are a **defensive primitive** that bounds the adversary's search space. The secrecy isn't cryptographic (it's not AES); it's **computational** — bounded by what the verifier permits the adversary to compute.
-
-### Limitations (must be stated honestly)
-
-- **Verifier exploits** — If the verifier is unsound, the instruction bound breaks and the adversary can do arbitrary computation. This is outside the eBPF threat model.
-- **Timing side channels** — `bpf_probe_read_kernel` is timing-observable (fault vs. success takes different cycles). A timing-based binary search over the heap is theoretically more efficient than linear scan. The instruction bound limits probes per program, but binary search could reduce the probe count to O(log |A|) ≈ 30. This is a real limitation. Mitigation: rate-limit `BPF_PROG_LOAD` via the LSM gate.
-- **Userspace root** — A userspace root process (not constrained by the verifier) can enumerate maps by ID. The LSM gate blocks this, but only for non-SPiCa processes. A process that compromises SPiCa's own PID has full access.
+- **Verifier exploits / arbitrary kernel write (ROP, 0-day)** — an attacker who can write kernel memory can write chain state directly, frozen map or not. Outside the eBPF threat model; noted in [§12](#12-known-limitations--attack-surface).
+- **`/proc/pid/mem` full-MITM of the daemon** — a root process can rewrite SPiCa's entire userspace view, including its chain copy and notary comparisons. In-band detection is blind to this; the stage-3 TPM PCR anchor (below) is the out-of-band answer: the daemon periodically extends a PCR with the chain head, and an offline quote shows a digest consistent with neither the honest chain nor any single forgery.
+- **Freeze is not authentication** — anyone privileged can freeze *their own* or even SPiCa's maps (monotonic, deny-of-service-ish). Since all SPiCa maps are frozen-at-load by design, the worst outcome is an attacker sealing SPiCa's state early — which is the desired end state anyway.
+- **The ledger is readable** — by design. Reading evidence without being able to forge or suppress it buys the attacker nothing; the security property never depended on confidentiality of the stream.
 
 ---
 
-## 7. LSM Map-Access Gate
+## 7. LSM Gates: Module Blocking + Deny-by-Default `bpf()`
 
-### The problem
+### Gate 1 — `kernel_read_file` (LKM blocking, shipped earlier)
 
-`.bss` globals are backed by an internal BPF map. Any process with CAP\_BPF can enumerate all maps on the system:
+A BPF LSM program on `kernel_read_file` intercepts `READING_MODULE` attempts. During the init window (`sc_gate == 0`) loads are allowed and audited (`[LKM-ALLOW]`); after the daemon closes and freezes the gate, loads are denied with EPERM and audited (`[LKM-DENY]`). Freezing removes the "reopen the gate later" hole: the gate can never be un-closed via the syscall path.
 
-```
-bpf(BPF_MAP_GET_NEXT_ID, …) → iterate all map IDs
-bpf(BPF_MAP_GET_FD_BY_ID, id) → get fd to any map
-bpf(BPF_MAP_LOOKUP_ELEM, fd, key, value) → read map contents
-```
+### Gate 2 — `bpf` syscall (deny-by-default, new)
 
-Against the eBPF adversary (who can't call syscalls), `.bss` is hidden. Against userspace root, it's a standard map — fully readable. The LSM gate closes this gap.
-
-### The defense
-
-A BPF LSM hook on the `bpf` syscall checks map-access commands:
+A second BPF LSM program hooks the `bpf` syscall itself and applies one rule:
 
 ```
-hook = "bpf"
-  read cmd (arg 0)
-  if cmd == BPF_MAP_GET_FD_BY_ID:
-    read map_id from userspace bpf_attr (bpf_probe_read_user)
-    if map_id matches any of SPiCa's stored IDs (.bss):
-      if caller_tgid != SPICA_PID:
-        return -EPERM
+caller_tgid != SPICA_PID → return -EPERM   (deny every bpf() command)
 ```
 
-Map IDs are written to `.bss` by the userspace loader right after program load, before the LSM hook is armed (same timing pattern as the existing `sc_gate` for LKM blocking). No BTF needed — `cmd` and `map_id` come from syscall arguments, not kernel structs.
+Attached **last**, after all of SPiCa's loads, attaches, pins, and freezes complete. Effects:
 
-**Surgical:** only blocks access to SPiCa's specific map IDs. Other processes' BPF tools (tcpdump, bpftrace, bcc) access their own maps and are unaffected.
+- **No `BPF_PROG_LOAD`** for outsiders — an attacker can't run the code that would read/patch maps, walk kptrs, or hook helpers. This also closes the verifier-bounded-scan and timing-side-channel paths from the old design: there is no attacker program to scan *with*.
+- **No `*_GET_FD_BY_ID`** — no fd acquisition to update, freeze-grief, or detach SPiCa's maps/links/programs.
+- **No `BPF_LINK_DETACH`** — links can't be ripped out from userspace by another process.
 
-### What it doesn't cover
+**Deny-wins stacking:** the kernel aggregates attached LSM programs such that a deny from *any* program denies the hook. A rootkit loading its own permissive LSM program cannot override this verdict; the only bypass is detaching SPiCa's program — which requires the very `bpf()` syscall the gate denies. `SPICA_PID` itself lives in the frozen `.bss`, so it cannot be zeroed at runtime to fail the gate open (a zero `SPICA_PID` disarms the gate — but writing it requires a program load, which the gate denies; the constant can only be set by the loader pre-freeze).
 
-- **ptrace / `/proc/pid/mem`** — Another root process could read SPiCa's process memory directly via ptrace, bypassing the BPF syscall entirely. This is a fundamental limitation: you can't protect against a process with the same privilege level reading your memory via `/proc/pid/mem`. Defense: off-host log shipping (if the attacker can read local memory, they can also suppress local alerts — only remote logging helps).
-- **SPiCa's own PID compromised** — If the attacker gains control of SPiCa's process, they have legitimate access to the maps.
+### What the gates don't cover
+
+- **ptrace / `/proc/pid/mem`** — another root process can still read/rewrite SPiCa's *userspace* memory directly. In-band defenses can't see this (stage-3 PCR anchoring is the out-of-band answer); off-host log shipping remains the operational mitigation.
+- **SPiCa's own PID compromised** — code execution inside the daemon inherits its exemption.
+- **Non-bpf() kernel doors** — `/proc/kcore` (read-only), perf sampling (read-only), and raw kernel writes (out of scope). The gates close the *write/enumerate* paths on the BPF subsystem; they don't pretend to close the kernel.
 
 ---
 
-## 8. Key Management & Obfuscation
+## 8. Why There Is No Key
 
-### TPM-sourced key
+The XOR obfuscation layer, the TPM `GetRandom` key source, the compile-time fallback key, and the `spica-key` dependency in the runtime path were all **removed** by the ledger refactor:
 
-On TPM-equipped hosts, the 64-bit XOR obfuscation key is sourced from `TPM2_GetRandom` via the [`tss-esapi`](https://docs.rs/tss-esapi) crate (direct library call to `libtss2-esys`). The key transits no pipe, no subprocess command line, no disk. It exists only in TPM hardware and in kernel volatile memory (`.bss` backing map) for the duration of the SPiCa process.
+- XOR was explicitly read-leakage theater — known-plaintext recoverable from predictable `comm` values, and the key itself sat in an enumerable `.bss` map (see [§6](#6-integrity-model-freeze--chain--notary-and-why-the-old-secrecy-claim-was-wrong)). Protecting a key that was already readable, to encrypt a stream that was already forgeable, added complexity without security.
+- Chain integrity replaces both roles: continuity is the authentication (gaps/divergence are detectable), and the records are deliberately plaintext-public — reading evidence you can't forge or suppress is worthless to the attacker.
+- `spica-key` (and its `tss-esapi` TPM binding) remains in the workspace **unused by the runtime**, reserved for stage 3, where the TPM's role changes from *key source* to *anchor*: PCR extension of chain heads and the sealed one-time uninstall token.
 
-On hosts without a TPM (VMs without vTPM, containers, machines without a TPM chip), SPiCa falls back to a per-build compile-time key generated from `/dev/urandom` by the build script. The fallback is **visibly loud** at startup with a warning banner.
-
-### `.bss` placement
-
-The following values live in the eBPF program's `.bss` section, written by userspace via `set_global()` before any program is loaded:
+`.bss` globals now in the frozen map:
 
 | Global | Purpose | Written by |
 |---|---|---|
-| `BASE_KEY` | XOR obfuscation key | userspace at load time |
-| `SPICA_PID` | SPiCa's own TGID (watchdog) | userspace at load time |
-| `SCHED_HEARTBEAT` | sched\_switch liveness timestamp | sched\_switch program on each invocation |
-| `NMI_LAST_HB` | NMI's record of last sched heartbeat | NMI program on each check |
-| `NMI_FIRST_TICK` | First NMI invocation ktime (grace period) | NMI program on first invocation |
-| `NMI_LAST_EMIT` | Throttle: last event emission ktime | NMI program on each emission |
+| `SPICA_PID` | Daemon TGID — exempts the daemon from the `bpf()` gate; arms the watchdog | userspace at load time (pre-freeze) |
+| `LEDGER_HEAD[128]` | Per-CPU chain head | writer programs on each append |
+| `LEDGER_SEQ[128]` | Per-CPU sequence number | writer programs on each append |
+| `LAST_TGID[128]` | Per-CPU sched dedupe cache | sched program on each switch |
+| `HB_LAST[128]` | Per-CPU heartbeat throttle ktime | sched program (idle path) |
+| `NMI_FIRST_TICK` | First NMI ktime (grace reference) | NMI program, first invocation |
+| `NMI_LAST_EMIT[128]` | Per-CPU notary throttle | NMI program on each emission |
 
-Named BPF maps are enumerable via the `bpf()` syscall's map iteration interface (blocked by the LSM gate — see [§7](#7-lsm-map-access-gate)); `.bss` globals are accessed through the same internal map but are not separately named or pinnable.
-
-### XOR obfuscation — read-leakage defense, not encryption
-
-All `ProcessInfo` fields are XOR-folded with the 64-bit `BASE_KEY` before being written to ring buffers. The `event_type` field is intentionally left unobfuscated so userspace can read it as a sentinel before deobfuscating the rest.
-
-This is **obfuscation against read-leakage, not encryption against a capable adversary.** XOR with an 8-byte repeating key is structurally vulnerable to known-plaintext: predictable `comm` values (`"bash"`, `"systemd"`, `"kthreadd"`) XOR'd against the ciphertext recover key bytes directly. The defense is appropriate for the eBPF adversary (who can't easily read the ring buffer — it requires the same capability gap that protects `.bss`), not for an adversary with binary access + ring buffer interception.
+All reads/writes of cross-program state are volatile (`read_volatile`/`write_volatile`) — the LLVM constant-fold fix from the BTF-bug incident, applied systematically this time.
 
 ---
 
-## 9. PCR-Bound TPM Sealing (Design)
+## 9. TPM PCR Anchoring (Implemented) + One-Time Uninstall Token (Design)
 
-> **Status:** Design phase. Not yet implemented. This section documents the target architecture for the research paper.
+> **Status:** **Implemented and VM-verified end to end** (vTPM under QEMU, kernel 6.8) — see `testing/freeze/RESULTS.md` rounds 4–5: PCR16 anchoring with live mirror verification (`[PCR-DIVERGE]` within one epoch of any foreign extension); pinned links surviving daemon SIGKILL (gates enforce with the process dead); the one-time token knock (`spica uninstall --token <hex>`); and **PCR-bound sealing** — `spica seal-install` binds a TPM NV secret to the measured boot chain (PCR4/9) plus the SPiCa binary hash (PCR23, the application-support PCR; 17–22 are DRTM-locality-locked), the initramfs `spica genesis` step measures the binary and unseals it, and the daemon extends `H(S)` into PCR16 as genesis. A tampered kernel, initramfs, or binary withholds the secret → SPiCa refuses to run (before arming anything) → the offline quote detects a missing genesis. This closes the genesis-compromise bypass: a daemon anchoring a forged ledger cannot produce a PCR16 history that starts with `H(S)`.
 
-### Overview
+### PCR chain-head anchoring (out-of-band finality)
 
-PCR-bound TPM sealing moves the key distribution boundary from the software layer into silicon. The key is sealed at install time against expected Platform Configuration Register (PCR) values, and can only be unsealed if the system's boot state matches the expected measurements.
+The in-band integrity model (§6) is blind to a full userspace MITM of the daemon (`/proc/pid/mem` rewrites of its chain copy). The only genuinely unwritable record on the box is a TPM Platform Configuration Register: PCR extend is one-way *in silicon* — a rootkit can extend garbage (detected below) but can never rewrite PCR history.
 
-### Boot measurement chain
+**Protocol (as shipped):**
 
-During boot, the firmware, bootloader, and kernel measure critical components into PCRs:
+1. Every epoch (10 s), the daemon computes `anchor_digest = SHA256("SPiCaANCHOR1" ‖ epoch ‖ (cpu, seq, head)\*)` over `ChainTracker::snapshot()` — its *verified* per-CPU chain positions, sorted, field-by-field. An empty snapshot still commits (cpu\_count = 0): every epoch proves the daemon is alive and looking.
+2. `TPM2_PCR_Extend(PCR16, sha256, anchor_digest)` via `tss-esapi` (in-process, `/dev/tpmrm0`; an empty *password* session is required — `execute_without_session` sends no auth and the TPM rejects it; found live, see RESULTS.md finding 7).
+3. **Live mirror verification:** extend is defined as `new = SHA256(old ‖ value)`, so the daemon recomputes the expected PCR locally every epoch and compares against `TPM2_PCR_Read`. Any divergence — attacker garbage-extension, a second extender, TPM confusion — fires `[PCR-DIVERGE]` within one epoch. This turns the one TPM operation a rootkit can still perform into a *detectable* event.
+
+**Restart semantics:** PCR16 (debug range) resets to zero on reboot — each boot gets a fresh genesis at the first extend. A daemon restart *within* a boot resumes by seeding the mirror from the live PCR value (with a loud note: non-zero PCR16 at start means a previous run this boot or tampering; only an offline quote distinguishes — in-band verification covers the daemon's lifetime). Offline `TPM2_Quote` of PCR16 against the daemon's epoch log reconstructs the full history: a digest sequence consistent with the honest chain, or with nothing.
+
+**Cadence and cost:** 10 s epochs; TPM extend+read ≈ a few ms — negligible. The epoch log prints the expected PCR value once a minute for offline correlation.
+
+### Boot measurement chain (unchanged, for the future sealed-token policy)
 
 | PCR | What it measures | Stability |
 |---|---|---|
@@ -431,41 +403,19 @@ During boot, the firmware, bootloader, and kernel measure critical components in
 | PCR 9 | Initramfs (GRUB measures initrd here) | Changes on initramfs update |
 | PCR 10 | IMA measurement list | Changes as executables are measured |
 
-> **Note:** PCR allocation is **boot-chain-dependent**. GRUB measures the kernel to PCR 4; systemd-stub measures to PCR 4 and the command line to PCR 8. The sealing policy must match the target boot chain.
+> **Note:** PCR allocation is **boot-chain-dependent**. GRUB measures the kernel to PCR 4; systemd-stub measures to PCR 4 and the command line to PCR 8. The anchoring policy must match the target boot chain.
 
-### The seal → unseal → inject → fail-safe flow
+### One-time uninstall token (authorized removal)
 
-1. **Seal (install time):** The 64-bit key is sealed against expected PCR values using `TPM2_Create` with a `TPM2_PolicyPCR` session. The sealed blob is stored on disk. It is encrypted with the TPM's internal key and can only be decrypted when the specified PCRs match.
+Stage 3 also pins SPiCa's program *links* to BPF-FS so the attachment set survives SIGKILL of the daemon (today only the `sc_wd` map pin survives). Pinned links change the removal story: a rootkit could otherwise `rm /sys/fs/bpf/spica_*` — a VFS op the `bpf()` gate never sees — so pin destruction is protected by an LSM program on `inode_unlink`/`file_open` for SPiCa's pin directory, deny for non-SPiCa callers.
 
-2. **Unseal (early boot, initramfs stage):** Before any untrusted userspace code executes, SPiCa's initramfs hook requests `TPM2_Unseal`. If the current PCR values match the seal policy, the TPM releases the key.
+Authorized removal then requires proof: at launch the daemon obtains a 32-byte token from `TPM2_GetRandom`, displays it **once** (operator must record it), and stores a PCR-**sealed** copy. `spica uninstall` presents the token via a gated `bpf()` attempt (the LSM gate reads it from the syscall's user memory, compares against the kernel-stored value, and sets a short-expiry authorized flag). Lost token + untampered boot → recovered by unsealing (`--recover`). Lost token + tampered boot → removal requires reboot and disabling the launcher — deliberate: on a machine whose PCRs show tampering, *removal-by-reboot is the correct incident response*, not a bug.
 
-3. **Inject:** The key is written to `.bss` via `set_global()` before programs are loaded.
+### What PCR anchoring does NOT catch
 
-4. **The trap:** If an attacker has modified the kernel (PCR 4 mismatch), swapped the initramfs (PCR 9 mismatch), or altered the Secure Boot policy (PCR 7 mismatch), the PCR hashes diverge. The TPM refuses to unseal, and SPiCa **fails safe** — it refuses to start rather than running blind with a compromised key.
-
-### PCR policy options
-
-| Policy | Sealed against | Strength | Operational cost |
-|---|---|---|---|
-| Strong | PCR 4 + 7 + 9 + 10 | Catches kernel, initramfs, Secure Boot, and IMA changes | Re-seal after every kernel/initramfs update |
-| Balanced | PCR 7 + 10 | Catches Secure Boot and IMA appraisal changes; stable across kernel updates | Re-seal only on Secure Boot policy or IMA policy changes |
-| Minimal | PCR 7 only | Catches Secure Boot state changes only | Very stable; weakest binding |
-
-For the research paper, present the **strong** policy and discuss the re-seal tradeoff in limitations.
-
-### Relationship to verifier-bounded address secrecy
-
-The two mechanisms are complementary:
-
-- **PCR sealing** protects the key at boot — it ensures the key is only available on a trusted system state.
-- **Verifier-bounded address secrecy + LSM gate** protect the key at runtime — they ensure the eBPF adversary can't locate or read the `.bss` where the key lives.
-
-Neither is sufficient alone. PCR sealing doesn't help if the key is compromised at runtime (map enumeration). Address secrecy doesn't help if the system was compromised before SPiCa started (hostile initramfs).
-
-### What PCR sealing does NOT catch
-
-- **Runtime LSM program detachment** — The BPF LSM programs (`spica_lsm_modblock`, the map-access gate) are loaded at runtime and are NOT measured to any PCR. A rootkit that detaches them after boot isn't caught by PCR sealing. What catches that is the NMI heartbeat (detecting that the detection system itself stopped running).
-- **Post-boot kernel exploitation** — If the kernel is exploited after boot (memory corruption → arbitrary write), PCRs are unchanged. This is the "nation-state" non-goal.
+- **Runtime LSM program detachment** — LSM programs are not measured to any PCR; the in-band SILENT/notary checks cover detachment.
+- **Post-boot kernel exploitation** — kernel memory corruption after boot leaves PCRs unchanged ("nation-state" non-goal).
+- **Pre-genesis compromise** — a rootkit running before SPiCa's first PCR extend anchors a forged-but-self-consistent history. Mitigation: initramfs-stage launch (see §13 install) and documented as a residual.
 
 ---
 
@@ -478,7 +428,7 @@ flowchart TD
     SB["UEFI Secure Boot<br/>─────────────────────────────<br/>Verifies bootloader signature against<br/>the UEFI db certificate store<br/>Measured to PCR 7"]
     MS["Kernel Module Signing<br/>─────────────────────────────<br/>CONFIG_MODULE_SIG_FORCE=y<br/>Kernel rejects unsigned .ko at load time"]
     IMA["IMA, Integrity Measurement Architecture<br/>─────────────────────────────<br/>Measures file hashes to TPM PCR10<br/>Appraise policy blocks non-matching signatures"]
-    SPICA["SPiCa<br/>─────────────────────────────<br/>LSM gate: blocks LKM loads + map enumeration<br/>sched_switch + NMI integrity channels<br/>Differential detection: DKOM · GHOST · TAMPER · SILENT · DUPE<br/>PCR-bound key sealing (design phase)"]
+    SPICA["SPiCa<br/>─────────────────────────────<br/>LSM gates: block LKM loads + deny bpf() for non-SPiCa<br/>Frozen hash-chain ledger + NMI notary<br/>Differential detection: DKOM · GHOST · TAMPER · SILENT · HOOK<br/>TPM PCR anchoring (stage 3, design)"]
 
     SB  -->|"boot chain verified"| MS
     MS  -->|"signed modules only"| IMA
@@ -523,7 +473,7 @@ Additionally, a time-base mismatch was discovered: `sched_last` stored `bpf_ktim
 | Per-process TAMPER never matured (jitter reset) | TAMPER is now a direct signal from the NMI program (`.bss` heartbeat comparison), not a per-process FSM with thresholds |
 | Per-process SILENT inverted when sched died | SILENT is now channel-level, computed from aggregates, not per-record predicates |
 | Time-base mismatch | `sched_last` now stores process-local time (`now` parameter), not `bpf_ktime_get_ns()` |
-| NMI was redundant observation | NMI is now an integrity checker — it detects sched death directly via `.bss` heartbeat |
+| NMI was redundant observation | NMI is now the ledger notary — it detects writer death and transport tampering via chain-position snapshots |
 
 ---
 
@@ -533,12 +483,14 @@ Additionally, a time-base mismatch was discovered: `sched_last` stored `bpf_ktim
 
 | Attack | Status | Notes |
 |---|---|---|
-| **Ring buffer consumer pointer manipulation** | **Detected** (SILENT) | `max(sched_last)` goes stale → SILENT. `SCHED_HEARTBEAT` still advances (program runs) → no false TAMPER. |
-| **Perf event struct DKOM** (zero `state` field) | **Detected** (SILENT) | NMI stops firing → no heartbeat events → SILENT on NMI channel |
-| **`task_struct` field spoofing** (overwrite pid/tgid) | **Partial** (DUPE) | If the spoofed TGID matches an existing record with a different `start_time_ns`, DUPE fires. If `start_time_ns` is also spoofed, this slips through. |
-| **eBPF program detachment** (remove from funcs array) | **Detected** (TAMPER) | NMI heartbeat freezes → TAMPER |
+| **Ring buffer record suppression/editing** (ptrace on the daemon's mmap) | **Detected** (TAMPER) | Notary diverges from the userspace chain: head-mismatch = edited (immediate); ahead across two consecutive notaries = suppressed (~1 s; a single ahead-notary is a benign in-flight race, observed live and tolerated) |
+| **Chain state spoof via `BPF_MAP_UPDATE_ELEM`** | **Blocked** | `.bss` frozen post-load — syscall writes EPERM for the map's lifetime |
+| **Ring buffer consumer pointer manipulation** | **Detected** (SILENT) | `max(sched_last)` goes stale → SILENT; chains keep advancing → notaries expose the gap |
+| **Perf event struct DKOM** (zero `state` field) | **Detected** (SILENT) | NMI stops firing → no notary events → SILENT on NMI channel |
+| **`task_struct` field spoofing** (overwrite pid/tgid) | **Future work** (DUPE) | Needs BTF-resolved `start_time`; the class is reserved in the engine |
+| **eBPF program detachment** (remove from funcs array) | **Detected** (SILENT/TAMPER) | Writers stop → chains freeze → records stop → SILENT; notaries keep reporting frozen seq |
+| **Attacker BPF programs (map walks, helper hooks)** | **Blocked** | `BPF_PROG_LOAD` denied by the `bpf()` LSM gate for non-SPiCa callers |
 | **Bytecode patched in-place** | **Not detected** | Requires arbitrary kernel write (LKM-level) — outside eBPF threat model |
-| **Timing side channel on `bpf_probe_read_kernel`** | **Theoretical risk** | Binary search over heap could find `.bss` in ~30 probes. See [§6](#6-verifier-bounded-address-secrecy) limitations. |
 
 ### Outside the eBPF threat model (acknowledged, not solved)
 
@@ -548,7 +500,7 @@ Additionally, a time-base mismatch was discovered: `sched_last` stored `bpf_ktim
 | **Dual-channel suppression** | **The live bomb** | Simultaneously suppress both sched + NMI. Inherits instability of NMI hooking. |
 | **Verifier exploit** | **Non-goal** | Escapes to arbitrary kernel code execution. Separate threat class. |
 | **ptrace / `/proc/pid/mem`** | **Fundamental limitation** | Same-privilege memory read. Only off-host log shipping helps. |
-| **Consumer pointer + heartbeat patch** | **LKM-level** | If attacker has arbitrary kernel write, they can both advance the consumer pointer AND write fake heartbeats. But arbitrary kernel write = LKM-level = outside threat model. |
+| **Consumer pointer + chain-state patch** | **LKM-level** | Arbitrary kernel write could advance the consumer pointer AND forge chain state directly in memory. But arbitrary kernel write = LKM-level = outside threat model; the frozen map only closes the syscall path. |
 
 ---
 
@@ -600,20 +552,22 @@ The eBPF programs cannot run on macOS. `cargo check` and unit tests for the dete
 ```shell
 make check      # cargo check for workspace
 make check-ebpf # cargo check for the eBPF crate (bpfel-unknown-none)
-make test       # unit tests for detection FSM, key derivation, obfuscation
+make test       # unit tests: chain hash, chain verification, detection FSM
 ```
 
 ---
 
 ## 14. Roadmap
 
-- **PCR-bound key sealing** — real hardware attestation. At install time, seal the key to expected PCR values (PCR 4/7/9/10). At runtime, unseal fails if PCRs changed. Replaces the current `GetRandom`-only TPM use with full hardware root of trust. See [§9](#9-pcr-bound-tpm-sealing-design).
-- **LSM map-access gate** — BPF LSM hook on the `bpf` syscall blocking map enumeration of SPiCa's internal state from non-SPiCa processes. See [§7](#7-lsm-map-access-gate).
-- **`BPF_PROG_LOAD` rate limiting** — Extend the LSM gate to rate-limit BPF program loads from non-SPiCa processes, mitigating the timing-side-channel risk on `.bss` discovery. See [§6](#6-verifier-bounded-address-secrecy) limitations.
-- **SipHash PRF obfuscation upgrade** — If the threat model grows to include adversaries with ring-buffer read access, swap XOR for a SipHash-1-3 keystream (the `siphasher` dep is already in the tree for the integrity token).
-- **Enterprise logging backend** — Optional Elasticsearch/Elastic SIEM shipping for SOC environments. All alerts, termination events, and restart counter anomalies shipped off-host in real time.
+**Shipped in stage 3** (see [§9](#9-tpm-pcr-anchoring-implemented--one-time-uninstall-token-design)): PCR16 anchoring + live mirror (`[PCR-DIVERGE]`), pinned links (SIGKILL survival), token knock + authorized uninstall. **Known stage-3 limitation:** bpffs pins are not VFS-protected (an `inode_unlink` gate is future work) — root can `rm` pins directly, at the cost of visible, deliberate action.
+
+**Later:**
+
+- **DUPE detection** — BTF-resolved `task_struct::start_time` in SWITCH records to catch TGID impersonation (class already reserved in the engine).
+- **`bpf_iter` census snapshots** — kernel-side task-list walks as a fourth differential view against `/proc` and the ledger.
+- **Enterprise logging backend** — Optional Elasticsearch/Elastic SIEM shipping for SOC environments. All alerts, ledger TAMPER verdicts, and restart anomalies shipped off-host in real time.
 - **Additional distro support** — Arch (mkinitcpio), openSUSE.
-- **CI pipeline** — Linux smoke tests exercising real eBPF load + attach + ring buffer flow.
+- **CI pipeline** — Linux smoke tests exercising real eBPF load + attach + freeze + ring buffer flow, plus the freeze/spoof/notary suites from `testing/`.
 
 ---
 

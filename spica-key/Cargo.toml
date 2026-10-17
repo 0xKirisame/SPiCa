@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 siphasher = { workspace = true }
+sha2 = { workspace = true }
+spica-common = { path = "../spica-common" }
 
 # TPM 2.0 hardware key source. Linux-only — wraps libtss2-esys which doesn't
 # exist on macOS. The TpmKeySource impl is cfg-gated in src/lib.rs.

@@ -35,6 +35,7 @@ log = { version = "0.4.22", default-features = false }
 tokio = { version = "1.40.0", default-features = false }
 which = { version = "6.0.0", default-features = false }
 siphasher = { version = "0.3", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 
 # TPM 2.0 access via the TSS Enhanced System API. Wraps libtss2-esys (C).
 # Linux-only — gated by target in dependent crates. Used by spica/key.rs

@@ -19,7 +19,6 @@ clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
-siphasher = { workspace = true }
 tokio = { workspace = true, features = [
     "macros",
     "rt",
@@ -29,12 +28,8 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 
-# TPM 2.0 hardware key source. Linux-only — libtss2-esys doesn't exist on macOS.
-# Code that uses tss-esapi must be gated with #[cfg(target_os = "linux")].
-# See key.rs::TpmKeySource. On non-Linux targets the compile-time fallback
-# key path is the only KeySource available.
-[target.'cfg(target_os = "linux")'.dependencies]
-tss-esapi = { workspace = true }
+# spica-key provides the stage-3 TPM PCR anchor (Linux-only internals via
+# tss-esapi; non-Linux builds compile to the degraded stub).
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

@@ -1,0 +1,33 @@
+---Trace---
+------State 0 (loop)-------
+univ={Process$0, Process$1, Addr$0, Addr$1, Addr$2, Addr$3, BpfMap$0, MapFD$0, ProbeReadI$0, ProbeReadI$1, SpinI$0, Probe$0, ScanDetector$0, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7}
+Int={-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7}
+seq/Int={0, 1, 2, 3, 4, 5, 6}
+String={}
+none={}
+this/Process={Process$0, Process$1}
+this/Addr={Addr$0, Addr$1, Addr$2, Addr$3}
+this/BpfMap={BpfMap$0}
+this/BpfMap<:kaddr={BpfMap$0->Addr$3}
+this/MapFD={MapFD$0}
+this/MapFD<:map={MapFD$0->BpfMap$0}
+this/MapFD<:holder={MapFD$0->Process$1}
+this/ProbeReadI={ProbeReadI$0, ProbeReadI$1}
+this/KtimeI={}
+this/SpinI={SpinI$0}
+this/CondJumpI={}
+this/MapStoreI={}
+this/OtherI={}
+this/Instr={ProbeReadI$0, ProbeReadI$1, SpinI$0}
+this/Instr<:pos={ProbeReadI$0->7, ProbeReadI$1->7, SpinI$0->6}
+this/Probe={Probe$0}
+this/Probe<:insn={Probe$0->ProbeReadI$1}
+this/Probe<:addr={Probe$0->Addr$2}
+this/DataflowEdge={}
+this/DataflowEdge<:src={}
+this/DataflowEdge<:dst={}
+this/LSMGate={}
+this/ScanDetector={ScanDetector$0}
+this/Owner={Process$1}
+this/BssMap={BpfMap$0}
+
